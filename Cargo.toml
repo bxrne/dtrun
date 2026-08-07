@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+nix = { version= "0.31.3", features = ["process", "ptrace",  "signal"]}
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] } 
