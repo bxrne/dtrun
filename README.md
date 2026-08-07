@@ -74,3 +74,7 @@ The goal is not to require applications to be rewritten for simulation. An OCI i
     For every intercepted event, dtrun writes a sequential log containing the event type, seed state, and injected outputs so the exact run can be audited or replayed later.
 9. Collect the Exit Status
     When the container's PID 1 terminates, dtrun catches the exit signal, cleans up child process state, and forwards the final exit code back to the caller.
+
+## Examples
+
+Currently storing OCI config.json samples from [opencontainers/runtime-spec](https://github.com/opencontainers/runtime-spec).
