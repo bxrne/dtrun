@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nix = { version= "0.31.3", features = ["process", "ptrace",  "signal"]}
+nix = { version= "0.31.3", features = ["process", "ptrace", "signal", "sched", "mount", "fs", "user", "hostname", "ioctl", "net"]}
 clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] } 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tar = "0.4"
+flate2 = "1.0"
+libc = "0.2"
+
+[profile.release]
+lto = true
+strip = true

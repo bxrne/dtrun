@@ -67,9 +67,8 @@ fn bad_configs_fail_to_parse() {
 
     for path in json_files(&bad_dir) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        match OciConfig::from_path(&path) {
-            Ok(_) => unexpected_successes.push(name),
-            Err(_) => {}
+        if OciConfig::from_path(&path).is_ok() {
+            unexpected_successes.push(name);
         }
     }
 
@@ -82,7 +81,7 @@ fn bad_configs_fail_to_parse() {
 
 #[test]
 fn each_bad_config_has_a_distinct_failure() {
-    // Sanity: we actually exercise every bad fixture (not an empty directory).
+    // Sanity: every bad fixture is actually exercised (not an empty directory).
     let bad_dir = examples_dir().join("bad");
     let files = json_files(&bad_dir);
     assert!(

@@ -114,7 +114,7 @@ fn is_valid_hugepage_size(s: &str) -> bool {
     matches!(rest, "KB" | "MB" | "GB" | "KiB" | "MiB" | "GiB")
 }
 
-/// Linux resource constraints. Fields beyond those we type strictly are accepted via flatten.
+/// Linux resource constraints. Fields beyond those strictly typed are accepted via flatten.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct LinuxResources {
@@ -196,14 +196,48 @@ pub struct RootFs {
     pub readonly: Option<bool>,
 }
 
+/// Process user credentials.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ProcessUser {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub additional_gids: Option<Vec<u32>>,
+}
+
+/// The container process configuration (`process`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Process {
+    pub args: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub cwd: Option<String>,
+    pub user: Option<ProcessUser>,
+    pub terminal: Option<bool>,
+    /// Remaining process fields kept as raw JSON so full runtime-spec examples still parse.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// A mount point requested by the config (`mounts`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Mount {
+    pub destination: String,
+    #[serde(rename = "type")]
+    pub fstype: Option<String>,
+    pub source: Option<String>,
+    pub options: Option<Vec<String>>,
+}
+
 /// The main OCI runtime configuration structure (`config.json`).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct OciConfig {
     pub oci_version: String,
     pub root: RootFs,
-    pub process: Option<serde_json::Value>,
+    pub process: Option<Process>,
     pub hostname: Option<String>,
+    pub mounts: Option<Vec<Mount>>,
     pub linux: Option<LinuxConfig>,
     pub windows: Option<WindowsConfig>,
     pub freebsd: Option<FreeBSDConfig>,
@@ -212,31 +246,164 @@ pub struct OciConfig {
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
-
-impl OciConfig {
+impl std::str::FromStr for OciConfig {
     /// Parse and validate an OCI config from a JSON string.
-    pub fn from_str(json: &str) -> Result<Self, ConfigError> {
+    fn from_str(json: &str) -> Result<Self, ConfigError> {
         let config: OciConfig = serde_json::from_str(json)?;
         config.validate()?;
         Ok(config)
     }
 
+    type Err = ConfigError;
+}
+
+impl OciConfig {
     /// Read, parse, and validate `config.json` from a filesystem path.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path)?;
-        Self::from_str(&content)
+        let config: OciConfig = serde_json::from_str(&content)?;
+        config.validate()?;
+        Ok(config)
     }
 
     /// Extra semantic checks beyond what serde types already enforce.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_version()?;
+        self.validate_root()?;
+        self.validate_process()?;
+        self.validate_hostname()?;
+        self.validate_mounts()?;
+        Ok(())
+    }
+
+    fn validate_version(&self) -> Result<(), ConfigError> {
         if self.oci_version.is_empty() {
             return Err(ConfigError::Validate("ociVersion must not be empty".into()));
         }
+        let (major, minor, patch) = parse_semver(&self.oci_version).ok_or_else(|| {
+            ConfigError::Validate(format!(
+                "ociVersion '{}' is not valid semver (expected MAJOR.MINOR.PATCH[-pre][+build])",
+                self.oci_version
+            ))
+        })?;
+        if !compatible_version(major, minor, patch) {
+            return Err(ConfigError::Validate(format!(
+                "ociVersion '{}' is not supported by dtrun",
+                self.oci_version
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_root(&self) -> Result<(), ConfigError> {
         if self.root.path.is_empty() {
             return Err(ConfigError::Validate("root.path must not be empty".into()));
         }
         Ok(())
     }
+
+    fn validate_process(&self) -> Result<(), ConfigError> {
+        let Some(process) = &self.process else {
+            return Ok(());
+        };
+        if let Some(args) = &process.args {
+            if args.is_empty() {
+                return Err(ConfigError::Validate(
+                    "process.args must not be empty".into(),
+                ));
+            }
+            if args.iter().any(|a| a.is_empty()) {
+                return Err(ConfigError::Validate(
+                    "process.args entries must not be empty".into(),
+                ));
+            }
+        }
+        if let Some(cwd) = &process.cwd
+            && !cwd.starts_with('/')
+        {
+            return Err(ConfigError::Validate(format!(
+                "process.cwd '{}' must be an absolute path",
+                cwd
+            )));
+        }
+        if let Some(env) = &process.env {
+            for kv in env {
+                if kv.split_once('=').is_none() {
+                    return Err(ConfigError::Validate(format!(
+                        "process.env entry '{kv}' must be KEY=VALUE"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_hostname(&self) -> Result<(), ConfigError> {
+        let Some(hostname) = &self.hostname else {
+            return Ok(());
+        };
+        if hostname.is_empty() || hostname.len() > 64 {
+            return Err(ConfigError::Validate(format!(
+                "hostname '{hostname}' must be 1..=64 characters"
+            )));
+        }
+        if hostname
+            .bytes()
+            .any(|b| !(b.is_ascii_alphanumeric() || b == b'-' || b == b'.'))
+        {
+            return Err(ConfigError::Validate(format!(
+                "hostname '{hostname}' contains invalid characters"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_mounts(&self) -> Result<(), ConfigError> {
+        let Some(mounts) = &self.mounts else {
+            return Ok(());
+        };
+        let mut seen = std::collections::HashSet::new();
+        for m in mounts {
+            if m.destination.is_empty() {
+                return Err(ConfigError::Validate(
+                    "mount.destination must not be empty".into(),
+                ));
+            }
+            if !m.destination.starts_with('/') {
+                return Err(ConfigError::Validate(format!(
+                    "mount.destination '{}' must be an absolute path",
+                    m.destination
+                )));
+            }
+            if !seen.insert(&m.destination) {
+                return Err(ConfigError::Validate(format!(
+                    "duplicate mount.destination '{}'",
+                    m.destination
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Versions of the OCI runtime-spec that dtrun understands.
+/// Compatible with the 1.x line; accepts the legacy 0.5.0 draft too.
+fn compatible_version(major: u64, minor: u64, _patch: u64) -> bool {
+    matches!((major, minor), (1, _) | (0, 5))
+}
+
+/// Minimal semver parser: `MAJOR.MINOR.PATCH` with optional `-prerelease` and
+/// `+build` suffixes, exactly as the OCI spec requires for `ociVersion`.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let core = s.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 #[cfg(test)]
@@ -255,5 +422,107 @@ mod hugepage_tests {
         for s in ["64kB", "2mb", "0MB", "MB", "2", "2B", ""] {
             assert!(!is_valid_hugepage_size(s), "expected invalid: {s}");
         }
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn base_config(oci_version: &str) -> OciConfig {
+        OciConfig {
+            oci_version: oci_version.to_owned(),
+            root: RootFs {
+                path: "rootfs".to_owned(),
+                readonly: None,
+            },
+            process: Some(Process {
+                args: Some(vec!["sh".to_owned()]),
+                env: None,
+                cwd: Some("/".to_owned()),
+                user: None,
+                terminal: None,
+                extra: HashMap::new(),
+            }),
+            hostname: None,
+            mounts: None,
+            linux: None,
+            windows: None,
+            freebsd: None,
+            zos: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_supported_versions() {
+        for v in ["1.0.0", "1.3.0", "1.2.3-dev", "1.0.0+build", "0.5.0-dev"] {
+            assert!(base_config(v).validate().is_ok(), "expected ok: {v}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_versions() {
+        for v in ["", "2.0.0", "0.1.0", "banana", "1", "1.2", "1.2.3.4"] {
+            assert!(base_config(v).validate().is_err(), "expected err: {v}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_root_path() {
+        let mut c = base_config("1.0.0");
+        c.root.path = String::new();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_args() {
+        let mut c = base_config("1.0.0");
+        c.process.as_mut().unwrap().args = Some(vec![]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_relative_cwd() {
+        let mut c = base_config("1.0.0");
+        c.process.as_mut().unwrap().cwd = Some("usr".to_owned());
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_env() {
+        let mut c = base_config("1.0.0");
+        c.process.as_mut().unwrap().env = Some(vec!["PATH".to_owned()]);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_bad_hostname() {
+        let mut c = base_config("1.0.0");
+        c.hostname = Some("bad_host/name!".to_owned());
+        assert!(c.validate().is_err());
+        c.hostname = Some("".to_owned());
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_mounts() {
+        let mut c = base_config("1.0.0");
+        c.mounts = Some(vec![
+            Mount {
+                destination: "/proc".to_owned(),
+                fstype: Some("proc".to_owned()),
+                source: Some("proc".to_owned()),
+                options: None,
+            },
+            Mount {
+                destination: "/proc".to_owned(),
+                fstype: Some("proc".to_owned()),
+                source: Some("proc".to_owned()),
+                options: None,
+            },
+        ]);
+        assert!(c.validate().is_err());
     }
 }
