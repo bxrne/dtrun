@@ -53,6 +53,16 @@ A minimal example bundle lives in `examples/bundle`. All runtime and container
 output is emitted as JSON over stdout/stderr through `tracing_subscriber`; set
 `RUST_LOG` to control verbosity (e.g. `RUST_LOG=debug`).
 
+Network modes:
+
+```sh
+# isolated: own netns, loopback only (default)
+cargo run -- run demo --bundle examples/bundle --net none
+
+# shared: bind and be reached on the host network
+cargo run -- run demo --bundle examples/bundle --net host
+```
+
 ## Plan
 
 - [x] Parse the OCI Container Bundle
@@ -80,6 +90,11 @@ output is emitted as JSON over stdout/stderr through `tracing_subscriber`; set
     The parent dtrun process enters a waitpid loop, keeping the container
     paused at every syscall boundary and dispatching entry/exit events
     (`src/runtime/supervisor.rs`).
+- [x] Isolate the Network
+    The container runs in its own network namespace with only loopback up
+    (`--net none`, the default). `--net host` shares the host network
+    namespace so a container can bind and be reached on the host's addresses —
+    used by the [httpbin example](#examples).
 - [x] Trap Sources of Non-Determinism
     Every time the container requests external data, dtrun inspects the active
     CPU registers to identify the syscall and substitutes deterministic values:
@@ -89,6 +104,9 @@ output is emitted as JSON over stdout/stderr through `tracing_subscriber`; set
     - [x] Time (clock_gettime, gettimeofday): host timestamps are replaced with
         a virtual clock — realtime frozen at a seeded epoch, monotonic time
         advancing by a fixed step per read.
+    - [x] I/O and scheduling (pass-through): every other syscall is recorded
+        in the trace as `pass` so its exact interleaving can be audited and
+        replayed, even where the value is not yet replaced.
 - [ ] Control Thread Scheduling
     When the process calls clone or clone3 to spawn threads, dtrun catches the
     event and registers the new Thread ID. Pausing/resuming threads so only one
@@ -108,11 +126,30 @@ output is emitted as JSON over stdout/stderr through `tracing_subscriber`; set
 
 `dtrun` validates its OCI compliance inside the container using
 [runtime-tools](https://github.com/opencontainers/runtime-tools)' `runtimetest`.
-Current result: **87/88 TAP tests pass** (57 pass, 30 skipped as
-not-configured). The single failure is `has a file at /dev/tty (default
-device)` — the container's default device nodes omit `/dev/tty`. Every
-other default-device, filesystem, namespace, process, and OCI-state check
-passes.
+Current result: **94/94 TAP tests pass** (61 pass, 33 skipped as
+not-configured). Every default-device, filesystem, namespace, process, and
+OCI-state check passes.
+
+The 33 skipped tests are skipped by `runtimetest` itself because the bundle
+does not configure the optional feature they exercise — they are "MAY"
+provisions of the spec, not runtime defects. They fall into two groups:
+
+- **12 unset optional spec fields.** `process.capabilities`,
+  `process.oomScoreAdj`, `process.ApparmorProfile`, `linux.seccomp`,
+  `linux.sysctl`, `linux.uidMappings`, `linux.gidMappings`,
+  `linux.maskedPaths`, `linux.readonlyPaths`, `linux.rootfsPropagation`,
+  `linux.mountlabel`, and `linux.devices`. `runtimetest` reports `# SKIP` when
+  a field is absent (e.g. `linux.seccomp not set`) rather than testing an
+  empty value. Adding any of these to a bundle makes the corresponding test
+  run — and fail until dtrun implements that feature.
+
+- **21 default-device metadata checks.** Each of the seven default devices
+  (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`,
+  `/dev/tty`, `/dev/ptmx`) has three checks — permissions, user ID, and group
+  ID — that `runtimetest` skips with "unconfigured" when the bundle declares no
+  `FileMode`/`UID`/`GID` for the device. The devices themselves are present and
+  correct (type, major, minor all pass); only their per-device metadata
+  configuration is untested.
 
 ## Tests
 
@@ -139,4 +176,43 @@ The suite is skipped when `runtimetest` is not on the path. Set
 
 ## Examples
 
-Currently storing OCI config.json samples from [opencontainers/runtime-spec](https://github.com/opencontainers/runtime-spec).
+### Minimal busybox bundle
+
+`examples/bundle` is a small busybox rootfs exercising the deterministic
+syscall traps. The config runs a short shell command that prints hostname,
+cwd, uid, gid, and an environment variable.
+
+### httpbin
+
+`examples/httpbin` runs [httpbin](https://httpbin.org) (Python/Flask via
+gunicorn) inside dtrun. The rootfs is built from the `kennethreitz/httpbin`
+image:
+
+```sh
+# one-time build (image tarball via docker export)
+docker create --name src kennethreitz/httpbin
+docker export src -o /tmp/httpbin.tar && docker rm src
+cargo run -- flatten /tmp/httpbin.tar examples/httpbin/rootfs
+```
+
+Run it with host networking (background server; use `create`/`start` or a
+shell `&`):
+
+```sh
+cargo run -- run httpbin --bundle examples/httpbin --net host \
+  --root /tmp/httpbin-state --seed 42 --pid-file /tmp/httpbin.pid
+```
+
+httpbin listens on `0.0.0.0:8080` (a high port — an unprivileged user
+namespace cannot bind ports <1024). Query it from the host:
+
+```sh
+curl http://127.0.0.1:8080/get
+curl http://127.0.0.1:8080/uuid
+```
+
+Every `getrandom` call httpbin and gunicorn make is intercepted and replaced
+with seed-generated bytes; the injected values are recorded in
+`/tmp/httpbin-state/httpbin/trace.jsonl`. Re-running with the same `--seed`
+yields byte-identical traces, while a different seed changes the injected
+randomness.
