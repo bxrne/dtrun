@@ -104,6 +104,28 @@ pub struct Host {
     mounts: Vec<Mount>,
     env: Vec<String>,
     seed: u64,
+    net_mode: NetMode,
+}
+
+/// Container network mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetMode {
+    /// Private network namespace with only loopback (the default).
+    None,
+    /// Share the host network namespace.
+    Host,
+}
+
+impl NetMode {
+    pub fn parse(value: &str) -> Result<Self, HostError> {
+        match value {
+            "none" => Ok(NetMode::None),
+            "host" => Ok(NetMode::Host),
+            other => Err(HostError::Config(format!(
+                "unknown network mode '{other}' (expected 'none' or 'host')"
+            ))),
+        }
+    }
 }
 
 /// Handles to the container output-relay threads; each returns the captured
@@ -112,6 +134,10 @@ type RelayHandles = Vec<JoinHandle<Vec<String>>>;
 
 impl Host {
     pub fn new(config: OciConfig, bundle: PathBuf, seed: u64) -> Self {
+        Self::with_net(config, bundle, seed, NetMode::None)
+    }
+
+    pub fn with_net(config: OciConfig, bundle: PathBuf, seed: u64, net_mode: NetMode) -> Self {
         let entrypoint = config.process.as_ref().and_then(|p| {
             let args = p.args.as_ref()?;
             let (command, rest) = args.split_first()?;
@@ -147,6 +173,7 @@ impl Host {
             mounts,
             env,
             seed,
+            net_mode,
         }
     }
 
@@ -381,6 +408,7 @@ impl Host {
             .unwrap_or_else(|| "/".to_owned());
         let readonly = self.config.root.readonly.unwrap_or(false);
         let env = self.env.clone();
+        let net_mode = self.net_mode;
 
         // Sync pipes: child->parent (child has unshared) and parent->child
         // (id mappings are written). Keeps the id-map writes race-free.
@@ -410,8 +438,12 @@ impl Host {
                 warn!("sethostname failed: {e}");
             }
 
-            // Bring up loopback in the fresh network namespace.
-            if let Err(e) = net::bring_up_loopback() {
+            // Bring up loopback in a fresh network namespace. In host mode the
+            // container shares the host netns, so the host loopback already
+            // exists and is up.
+            if net_mode == NetMode::None
+                && let Err(e) = net::bring_up_loopback()
+            {
                 warn!("bringing up loopback failed: {e}");
             }
 
@@ -477,10 +509,14 @@ impl Host {
         });
 
         let child = unsafe {
+            let mut flags = NAMESPACE_FLAGS;
+            if net_mode == NetMode::Host {
+                flags &= !CloneFlags::CLONE_NEWNET;
+            }
             clone(
                 cb,
                 &mut stack,
-                NAMESPACE_FLAGS,
+                flags,
                 Some(Signal::SIGCHLD as i32),
             )
         }
