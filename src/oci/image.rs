@@ -39,8 +39,11 @@ impl From<std::io::Error> for ImageError {
 /// Flatten an OCI/Docker image tarball into a deterministic rootfs at `dest`.
 ///
 /// Gzip is detected by magic bytes; any other archive type is treated as a
-/// plain tar. Existing contents of `dest` are preserved; files are unpacked in
-/// sorted path order for byte-reproducible results.
+/// plain tar. Existing contents of `dest` are preserved. Entries are streamed
+/// in archive order so that Docker whiteouts (which must run after the file
+/// they delete) keep their semantics; `normalize_tree` then canonicalizes all
+/// metadata so the result is byte-reproducible regardless of the archive's
+/// own timestamps or ownership.
 pub fn flatten(image: &Path, dest: &Path) -> Result<(), ImageError> {
     if !dest.exists() {
         fs::create_dir_all(dest)?;
@@ -62,22 +65,13 @@ pub fn flatten(image: &Path, dest: &Path) -> Result<(), ImageError> {
 
 fn unpack_reader<R: Read>(reader: R, dest: &Path) -> Result<(), ImageError> {
     let mut archive = tar::Archive::new(reader);
-    let mut entries: Vec<tar::Entry<'_, R>> = archive.entries()?.collect::<std::io::Result<_>>()?;
 
-    // Deterministic ordering: process paths in sorted order.
-    entries.sort_by(|a, b| {
-        let ap = a
-            .path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let bp = b
-            .path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        ap.cmp(&bp)
-    });
+    for entry in archive.entries()? {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-    for mut entry in entries {
         let raw_path = match entry.path() {
             Ok(p) => p.into_owned(),
             Err(e) => {

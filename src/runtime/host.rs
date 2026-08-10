@@ -26,7 +26,6 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use tracing::{error, info, warn};

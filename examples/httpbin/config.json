@@ -1,0 +1,66 @@
+{
+	"ociVersion": "1.0.0",
+	"root": {
+		"path": "rootfs",
+		"readonly": false
+	},
+	"hostname": "dtrun-httpbin",
+	"mounts": [
+		{
+			"destination": "/proc",
+			"type": "proc",
+			"source": "proc",
+			"options": ["nosuid", "noexec", "nodev"]
+		},
+		{
+			"destination": "/dev",
+			"type": "tmpfs",
+			"source": "tmpfs",
+			"options": ["nosuid", "strictatime", "mode=755", "size=65536k"]
+		},
+		{
+			"destination": "/dev/pts",
+			"type": "devpts",
+			"source": "devpts",
+			"options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"]
+		},
+		{
+			"destination": "/sys",
+			"type": "sysfs",
+			"source": "sysfs",
+			"options": ["nosuid", "noexec", "nodev", "ro"]
+		},
+		{
+			"destination": "/dev/mqueue",
+			"type": "mqueue",
+			"source": "mqueue",
+			"options": ["nosuid", "noexec", "nodev"]
+		},
+		{
+			"destination": "/dev/shm",
+			"type": "tmpfs",
+			"source": "shm",
+			"options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"]
+		}
+	],
+	"process": {
+		"args": [
+			"/usr/local/bin/gunicorn",
+			"-b",
+			"0.0.0.0:8080",
+			"-w",
+			"2",
+			"httpbin:app"
+		],
+		"env": [
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"PYTHONPATH=/httpbin"
+		],
+		"cwd": "/httpbin",
+		"terminal": false,
+		"user": {
+			"uid": 0,
+			"gid": 0
+		}
+	}
+}

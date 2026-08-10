@@ -92,6 +92,12 @@ pub struct BundleArgs {
     /// Write the container's PID to this file
     #[arg(long, value_name = "FILE")]
     pub pid_file: Option<PathBuf>,
+
+    /// Network mode: `none` (own netns, loopback only) or `host`
+    /// (share the host network namespace). `host` lets a container
+    /// bind and be reached on the host's addresses.
+    #[arg(long, value_name = "MODE", default_value = "none")]
+    pub net: String,
 }
 
 #[derive(Args, Debug)]

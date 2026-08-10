@@ -9,4 +9,4 @@ pub mod net;
 pub mod state;
 pub mod supervisor;
 
-pub use host::Host;
+pub use host::{Host, NetMode};

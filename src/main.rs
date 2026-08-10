@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use dtrun::cli::{Cli, Commands, CreateArgs, ExecArgs, FlattenArgs, RunArgs, SpecArgs};
 use dtrun::oci::config::OciConfig;
 use dtrun::oci::image;
-use dtrun::runtime::{Host, host};
+use dtrun::runtime::{Host, NetMode, host};
 
 fn main() {
     let cli = Cli::parse();
@@ -58,7 +58,7 @@ fn main() {
 
 fn cmd_create(cli: &Cli, root: &Path, args: &CreateArgs) -> i32 {
     let bundle = args.bundle.bundle.clone();
-    let host = match load_host(&bundle, cli.seed) {
+    let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
         Ok(h) => h,
         Err(e) => return fail(e),
     };
@@ -84,7 +84,7 @@ fn cmd_start(root: &Path, id: &str) -> i32 {
 
 fn cmd_run(cli: &Cli, root: &Path, args: &RunArgs) -> i32 {
     let bundle = args.bundle.bundle.clone();
-    let host = match load_host(&bundle, cli.seed) {
+    let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
         Ok(h) => h,
         Err(e) => return fail(e),
     };
@@ -172,11 +172,12 @@ fn cmd_flatten(args: &FlattenArgs) -> i32 {
     }
 }
 
-fn load_host(bundle: &Path, seed: u64) -> Result<Host, String> {
+fn load_host(bundle: &Path, seed: u64, net: &str) -> Result<Host, String> {
     let config_path = bundle.join("config.json");
     let config = OciConfig::from_path(&config_path)
         .map_err(|e| format!("failed to load {}: {e}", config_path.display()))?;
-    Ok(Host::new(config, bundle.to_path_buf(), seed))
+    let net_mode = NetMode::parse(net).map_err(|e| e.to_string())?;
+    Ok(Host::with_net(config, bundle.to_path_buf(), seed, net_mode))
 }
 
 fn write_pid_file(path: Option<&std::path::Path>, pid: i32) {
