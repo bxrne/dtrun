@@ -418,19 +418,26 @@ impl Host {
 
             // Open the host's default device nodes before chroot so they can be
             // bind-mounted into the container's `/dev` (mknod(2) is forbidden
-            // inside a user namespace).
+            // inside a user namespace). O_PATH avoids requiring read/write
+            // access to each node — `/dev/tty`, for example, can only be
+            // opened read/write by a process with a controlling terminal.
             let host_devices: Vec<(String, OwnedFd)> =
                 ["null", "zero", "full", "random", "urandom", "tty"]
                     .iter()
                     .filter_map(|name| {
                         let path = format!("/dev/{name}");
-                        std::fs::OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .custom_flags(libc::O_CLOEXEC)
-                            .open(&path)
-                            .ok()
-                            .map(|f| (name.to_string(), f.into()))
+                        let c = std::ffi::CString::new(path.as_str()).ok()?;
+                        // O_PATH: no read/write permission needed (e.g. /dev/tty
+                        // can only be opened read/write by a controlling
+                        // terminal). bind_mount resolves the node via
+                        // /proc/self/fd, so the fd need never be I/O'd.
+                        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+                        if fd < 0 {
+                            None
+                        } else {
+                            use std::os::fd::FromRawFd;
+                            Some((name.to_string(), unsafe { OwnedFd::from_raw_fd(fd) }))
+                        }
                     })
                     .collect();
 
