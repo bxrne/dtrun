@@ -123,6 +123,76 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+fn count_events(trace: &str, event: &str) -> usize {
+    trace
+        .lines()
+        .filter(|l| l.contains(&format!("\"event\":\"{event}\"")))
+        .count()
+}
+
+/// Locate a C compiler for the multithreaded determinism fixture.
+fn find_cc() -> Option<PathBuf> {
+    for name in ["cc", "gcc", "clang"] {
+        if Command::new(name)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Some(PathBuf::from(name));
+        }
+    }
+    None
+}
+
+/// Build a scratch OCI bundle running the statically-linked pthread fixture.
+/// Returns `None` (test skips) when no compiler or static pthread build is
+/// available, mirroring the runtimetest skip path.
+fn make_thread_bundle() -> Option<PathBuf> {
+    let cc = find_cc()?;
+    let dir = std::env::temp_dir().join(format!(
+        "dtrun-thread-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create thread bundle");
+    copy_dir(&bundle_dir().join("rootfs"), &dir.join("rootfs"));
+
+    let bin = dir.join("rootfs/bin/workload");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/threads.c");
+    let status = Command::new(&cc)
+        .args(["-static", "-pthread", "-O0", "-o"])
+        .arg(&bin)
+        .arg(&fixture)
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+
+    let config = serde_json::json!({
+        "ociVersion": "1.0.0",
+        "root": { "path": "rootfs", "readonly": false },
+        "hostname": "dtrun-thread",
+        "process": {
+            "args": ["/bin/workload"],
+            "env": ["PATH=/usr/bin:/bin"],
+            "cwd": "/"
+        }
+    });
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .expect("write thread config");
+    Some(dir)
+}
+
 #[test]
 fn same_seed_produces_byte_identical_trace() {
     let bundle = single_bundle("true");
@@ -187,6 +257,58 @@ fn stdout_output_is_relayed_and_recorded() {
         !stdout_lines.is_empty(),
         "stdout events must be recorded in the trace"
     );
+}
+
+#[test]
+fn multithreaded_run_is_deterministic_and_seeded() {
+    let Some(bundle) = make_thread_bundle() else {
+        eprintln!(
+            "no C compiler or static pthread build available; \
+             skipping multithreaded determinism test"
+        );
+        return;
+    };
+    let root = ScratchRoot::new("threads");
+    let a = dtrun_run(root.path(), "thr", 42, &bundle);
+    assert_eq!(exit_code(&a), 0, "run failed: {}", stderr(&a));
+    let trace_a = root.trace("thr");
+
+    let b = dtrun_run(root.path(), "thr", 42, &bundle);
+    assert_eq!(exit_code(&b), 0, "run failed: {}", stderr(&b));
+    let trace_b = root.trace("thr");
+
+    let c = dtrun_run(root.path(), "thr", 7, &bundle);
+    assert_eq!(exit_code(&c), 0, "run failed: {}", stderr(&c));
+    let trace_c = root.trace("thr");
+
+    let _ = std::fs::remove_dir_all(&bundle);
+
+    // The workload spawned four workers, each drawing randomness inside the
+    // critical section (so the mutex is genuinely contended).
+    assert_eq!(count_events(&trace_a, "thread_create"), 4);
+    let worker_lines: Vec<&str> = trace_a
+        .lines()
+        .filter(|l| l.contains("\"line\":\"thread "))
+        .collect();
+    assert_eq!(
+        worker_lines.len(),
+        4,
+        "each worker must report exactly once"
+    );
+    assert!(
+        trace_a.contains("\"schedule\""),
+        "the scheduler must interleave the threads"
+    );
+    assert!(
+        trace_a.contains("counter=4"),
+        "the workers must serialize through the mutex"
+    );
+
+    // Same seed => byte-identical event stream, including thread interleaving.
+    assert!(!trace_a.is_empty());
+    assert_eq!(trace_a, trace_b, "same seed must yield an identical trace");
+    // Different seed => different injected randomness.
+    assert_ne!(trace_a, trace_c, "different seeds must change the trace");
 }
 
 #[test]
@@ -403,13 +525,13 @@ fn container_passes_oci_runtimetest_validation() {
 fn poll_status(path: &Path, wanted: &[&str]) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                let status = v["status"].as_str().unwrap_or("").to_owned();
-                if wanted.contains(&status.as_str()) {
-                    return status;
-                }
-            }
+        let status = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|v| v["status"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        if wanted.contains(&status.as_str()) {
+            return status;
         }
         if std::time::Instant::now() > deadline {
             panic!(

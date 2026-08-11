@@ -13,6 +13,7 @@ use crate::runtime::{cgroup, net};
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sched::{CloneFlags, clone, setns};
+use nix::sys::personality::{self, Persona};
 use nix::sys::ptrace::{self, Options};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::stat::Mode;
@@ -497,13 +498,24 @@ impl Host {
             let _ = dup2_stdout(&stdout_w);
             let _ = dup2_stderr(&stderr_w);
 
-            // Hand control of every syscall to the supervisor, then freeze at
-            // the first stop until `dtrun start` (or `run`) releases us.
+            // Freeze at the first stop until `dtrun start` (or `run`) releases
+            // us. Hand control of every syscall to the supervisor.
             if let Err(e) = ptrace::traceme() {
                 error!("ptrace TRACEME failed: {e}");
                 return 1;
             }
             unsafe { libc::raise(libc::SIGSTOP) };
+
+            // Disable ASLR so the workload's address layout is deterministic
+            // across runs; the supervisor also receives every mmap, but with
+            // randomized base addresses the allocator's munmap-vs-mprotect
+            // decisions vary. `personality` survives the exec below.
+            match personality::get() {
+                Ok(pers) => {
+                    let _ = personality::set(pers | Persona::ADDR_NO_RANDOMIZE);
+                }
+                Err(e) => warn!(?e, "could not disable ASLR"),
+            }
 
             exec_entrypoint(&command, &args, &env)
         });
@@ -513,12 +525,7 @@ impl Host {
             if net_mode == NetMode::Host {
                 flags &= !CloneFlags::CLONE_NEWNET;
             }
-            clone(
-                cb,
-                &mut stack,
-                flags,
-                Some(Signal::SIGCHLD as i32),
-            )
+            clone(cb, &mut stack, flags, Some(Signal::SIGCHLD as i32))
         }
         .map_err(HostError::Clone)?;
 

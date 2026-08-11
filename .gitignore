@@ -1,3 +1,4 @@
 /target
 /examples/bundle/rootfs
 /examples/httpbin/rootfs
+/debug
