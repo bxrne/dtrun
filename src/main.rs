@@ -5,9 +5,7 @@ use std::path::Path;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use libdtrun::cli::{
-    Cli, Commands, ConformanceArgs, CreateArgs, ExecArgs, FlattenArgs, RunArgs, SpecArgs,
-};
+use libdtrun::cli::{Cli, Commands, CreateArgs, FlattenArgs, RunArgs};
 use libdtrun::oci::config::OciConfig;
 use libdtrun::oci::image;
 use libdtrun::runtime::{Host, NetMode, host};
@@ -35,17 +33,160 @@ fn main() {
 
     let root = cli.root_dir();
     let code = match &cli.command {
-        Commands::Create(args) => cmd_create(&cli, &root, args),
-        Commands::Start(args) => cmd_start(&root, &args.id),
-        Commands::Run(args) => cmd_run(&cli, &root, args),
-        Commands::Kill(args) => cmd_kill(&root, &args.id, &args.signal),
-        Commands::Delete(args) => cmd_delete(&root, &args.id, args.force),
-        Commands::State(args) => cmd_state(&root, &args.id),
-        Commands::List(args) => cmd_list(&root, &args.format),
-        Commands::Exec(args) => cmd_exec(&root, args),
-        Commands::Spec(args) => cmd_spec(args),
-        Commands::Flatten(args) => cmd_flatten(args),
-        Commands::Conformance(args) => cmd_conformance(&cli, args),
+        Commands::Create(args) => {
+            let cli: &Cli = &cli;
+            let root: &Path = &root;
+            let args: &CreateArgs = args;
+            let bundle = args.bundle.bundle.clone();
+            let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
+                Ok(h) => h,
+                Err(e) => std::process::exit(fail(e)),
+            };
+            match host.create(root, &args.bundle.id) {
+                Ok(pid) => {
+                    write_pid_file(args.bundle.pid_file.as_deref(), pid.as_raw());
+                    info!(id = %args.bundle.id, pid = pid.as_raw(), "created");
+                    0
+                }
+
+                Err(e) => fail(e),
+            }
+        }
+        Commands::Start(args) => {
+            let root: &Path = &root;
+            let id: &str = &args.id;
+            match host::start_container(root, id) {
+                Ok(()) => {
+                    info!(id, "started");
+                    0
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Commands::Run(args) => {
+            let cli: &Cli = &cli;
+            let root: &Path = &root;
+            let args: &RunArgs = args;
+            let bundle = args.bundle.bundle.clone();
+            let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
+                Ok(h) => h,
+                Err(e) => std::process::exit(fail(e)),
+            };
+            match host.run(root, &args.bundle.id) {
+                Ok(code) => {
+                    info!(id = %args.bundle.id, exit_code = code, "run finished");
+                    code
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Commands::Kill(args) => {
+            let root: &Path = &root;
+            let id: &str = &args.id;
+            let signal: &str = &args.signal;
+            match host::kill_container(root, id, signal) {
+                Ok(()) => {
+                    info!(id, signal, "signal sent");
+                    0
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Commands::Delete(args) => {
+            let root: &Path = &root;
+            let id: &str = &args.id;
+            let force = args.force;
+            match host::delete_container(root, id, force) {
+                Ok(()) => {
+                    info!(id, "deleted");
+                    0
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Commands::State(args) => {
+            let root: &Path = &root;
+            let id: &str = &args.id;
+            match host::print_state(root, id) {
+                Ok(()) => 0,
+                Err(e) => fail(e),
+            }
+        }
+        Commands::List(args) => {
+            let root: &Path = &root;
+            let format: &str = &args.format;
+            match host::list_containers(root, format) {
+                Ok(()) => 0,
+                Err(e) => fail(e),
+            }
+        }
+        Commands::Exec(args) => {
+            let root: &Path = &root;
+            match host::exec_in_container(
+                root,
+                &args.id,
+                &args.command,
+                args.cwd.as_deref(),
+                &args.env,
+            ) {
+                Ok(code) => code,
+                Err(e) => fail(e),
+            }
+        }
+        Commands::Spec(args) => {
+            let config = default_config_json();
+            let path = args.bundle.join("config.json");
+            let mut f = match std::fs::File::create(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    error!(path = %path.display(), ?e, "failed to create config.json");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(e) = writeln!(f, "{config}") {
+                error!(path = %path.display(), ?e, "failed to write config.json");
+                std::process::exit(1);
+            }
+            info!(path = %path.display(), "wrote default config");
+            0
+        }
+        Commands::Flatten(args) => {
+            let args: &FlattenArgs = args;
+            match image::flatten(&args.image, &args.dest) {
+                Ok(()) => {
+                    info!(
+                        image = %args.image.display(),
+                        dest = %args.dest.display(),
+                        "flattened image deterministically"
+                    );
+                    0
+                }
+                Err(e) => fail(e),
+            }
+        }
+        Commands::Conformance(args) => {
+            let cli: &Cli = &cli;
+            match libdtrun::conformance::run(&args.bundle, cli.seed, args.keep) {
+                Ok(summary) => {
+                    info!(
+                        total = summary.total,
+                        pass = summary.pass,
+                        skip = summary.skip,
+                        fail = summary.fail,
+                        "runtimetest conformance summary"
+                    );
+                    if summary.fail > 0 {
+                        for failure in &summary.failures {
+                            error!("{failure}");
+                        }
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(e) => fail(e),
+            }
+        }
         Commands::Version => {
             info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -57,145 +198,6 @@ fn main() {
     };
 
     std::process::exit(code);
-}
-
-fn cmd_create(cli: &Cli, root: &Path, args: &CreateArgs) -> i32 {
-    let bundle = args.bundle.bundle.clone();
-    let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
-        Ok(h) => h,
-        Err(e) => return fail(e),
-    };
-    match host.create(root, &args.bundle.id) {
-        Ok(pid) => {
-            write_pid_file(args.bundle.pid_file.as_deref(), pid.as_raw());
-            info!(id = %args.bundle.id, pid = pid.as_raw(), "created");
-            0
-        }
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_start(root: &Path, id: &str) -> i32 {
-    match host::start_container(root, id) {
-        Ok(()) => {
-            info!(id, "started");
-            0
-        }
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_run(cli: &Cli, root: &Path, args: &RunArgs) -> i32 {
-    let bundle = args.bundle.bundle.clone();
-    let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
-        Ok(h) => h,
-        Err(e) => return fail(e),
-    };
-    match host.run(root, &args.bundle.id) {
-        Ok(code) => {
-            info!(id = %args.bundle.id, exit_code = code, "run finished");
-            code
-        }
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_kill(root: &Path, id: &str, signal: &str) -> i32 {
-    match host::kill_container(root, id, signal) {
-        Ok(()) => {
-            info!(id, signal, "signal sent");
-            0
-        }
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_delete(root: &Path, id: &str, force: bool) -> i32 {
-    match host::delete_container(root, id, force) {
-        Ok(()) => {
-            info!(id, "deleted");
-            0
-        }
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_state(root: &Path, id: &str) -> i32 {
-    match host::print_state(root, id) {
-        Ok(()) => 0,
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_list(root: &Path, format: &str) -> i32 {
-    match host::list_containers(root, format) {
-        Ok(()) => 0,
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_exec(root: &Path, args: &ExecArgs) -> i32 {
-    match host::exec_in_container(
-        root,
-        &args.id,
-        &args.command,
-        args.cwd.as_deref(),
-        &args.env,
-    ) {
-        Ok(code) => code,
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_spec(args: &SpecArgs) -> i32 {
-    let config = default_config_json();
-    let path = args.bundle.join("config.json");
-    let mut f = match std::fs::File::create(&path) {
-        Ok(f) => f,
-        Err(e) => return fail(format!("cannot write {}: {e}", path.display())),
-    };
-    if let Err(e) = writeln!(f, "{config}") {
-        return fail(format!("cannot write {}: {e}", path.display()));
-    }
-    info!(path = %path.display(), "wrote default config");
-    0
-}
-
-fn cmd_flatten(args: &FlattenArgs) -> i32 {
-    match image::flatten(&args.image, &args.dest) {
-        Ok(()) => {
-            info!(
-                image = %args.image.display(),
-                dest = %args.dest.display(),
-                "flattened image deterministically"
-            );
-            0
-        }
-        Err(e) => fail(e),
-    }
-}
-
-fn cmd_conformance(cli: &Cli, args: &ConformanceArgs) -> i32 {
-    match libdtrun::conformance::run(&args.bundle, cli.seed, args.keep) {
-        Ok(summary) => {
-            info!(
-                total = summary.total,
-                pass = summary.pass,
-                skip = summary.skip,
-                fail = summary.fail,
-                "runtimetest conformance summary"
-            );
-            if summary.fail > 0 {
-                for failure in &summary.failures {
-                    error!("{failure}");
-                }
-                1
-            } else {
-                0
-            }
-        }
-        Err(e) => fail(e),
-    }
 }
 
 fn load_host(bundle: &Path, seed: u64, net: &str) -> Result<Host, String> {
