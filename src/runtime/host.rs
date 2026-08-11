@@ -1,44 +1,37 @@
-//! Container runtime: turns an [`OciConfig`] into an isolated, deterministically
-//! supervised child, and implements the OCI lifecycle (`create`/`start`/`run`/
-//! `kill`/`delete`/`state`/`exec`).
+//! Container runtime host: turns an [`OciConfig`] into an isolated, deterministically
+//! supervised child, and drives the container lifecycle.
 
-use crate::oci::config::{Mount, OciConfig, Process};
-use crate::runtime::credentials::{apply_capabilities, apply_oom_score_adj};
-use crate::runtime::mounts::{
-    apply_masked_paths, apply_mount, apply_readonly_paths, make_root_private, make_root_readonly,
-    setup_default_devices,
-};
+use crate::oci::config::{LinuxIdMapping, Mount, OciConfig};
+use crate::runtime::child::setup_and_exec_child;
 use crate::runtime::namespaces::map_root_user;
 use crate::runtime::state::{self, ContainerState, Status};
 use crate::runtime::supervisor;
-use crate::runtime::{cgroup, net};
+use crate::runtime::cgroup;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
-use nix::sched::{CloneFlags, clone, setns};
-use nix::sys::personality::{self, Persona};
+use nix::sched::{CloneFlags, clone};
 use nix::sys::ptrace::{self, Options};
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::Signal;
 use nix::sys::stat::Mode;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::ForkResult;
-use nix::unistd::{
-    Pid, chdir, chroot, dup2_stderr, dup2_stdout, execvpe, fork, mkfifo, pipe2, read, sethostname,
-    write,
-};
-use std::ffi::CString;
+use nix::unistd::{Pid, fork, mkfifo, pipe2, read, write};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+pub use crate::runtime::exec::exec_in_container;
+pub use crate::runtime::ops::{
+    delete_container, kill_container, list_containers, print_state, start_container,
+};
 
 /// Stack for the cloned child; sized so PID1 workloads can't overflow it.
 const STACK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Namespace flags applied to the cloned child. CLONE_NEWUSER must be set so
-/// that an unprivileged caller can create the remaining namespaces, including
-/// a dedicated network namespace (CLONE_NEWNET) for isolation.
+/// Namespace flags applied to the cloned child.
 const NAMESPACE_FLAGS: CloneFlags = CloneFlags::CLONE_NEWUSER
     .union(CloneFlags::CLONE_NEWPID)
     .union(CloneFlags::CLONE_NEWUTS)
@@ -98,18 +91,6 @@ impl From<supervisor::SuperviseError> for HostError {
     }
 }
 
-pub struct Host {
-    config: OciConfig,
-    bundle: PathBuf,
-    rootfs: String,
-    entrypoint: Option<(String, Vec<String>)>,
-    process: Option<Process>,
-    mounts: Vec<Mount>,
-    env: Vec<String>,
-    seed: u64,
-    net_mode: NetMode,
-}
-
 /// Container network mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetMode {
@@ -131,9 +112,15 @@ impl NetMode {
     }
 }
 
-/// Handles to the container output-relay threads; each returns the captured
-/// lines in stream order.
+/// Handles to the container output-relay threads.
 type RelayHandles = Vec<JoinHandle<Vec<String>>>;
+
+pub struct Host {
+    config: OciConfig,
+    bundle: PathBuf,
+    seed: u64,
+    net_mode: NetMode,
+}
 
 impl Host {
     pub fn new(config: OciConfig, bundle: PathBuf, seed: u64) -> Self {
@@ -141,78 +128,92 @@ impl Host {
     }
 
     pub fn with_net(config: OciConfig, bundle: PathBuf, seed: u64, net_mode: NetMode) -> Self {
-        let entrypoint = config.process.as_ref().and_then(|p| {
-            let args = p.args.as_ref()?;
-            let (command, rest) = args.split_first()?;
-            Some((command.clone(), rest.to_vec()))
-        });
-
-        let root_path = Path::new(&config.root.path);
-        let rootfs = if root_path.is_absolute() {
-            config.root.path.clone()
-        } else {
-            bundle
-                .join(&config.root.path)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        let env = config
-            .process
-            .as_ref()
-            .and_then(|p| p.env.clone())
-            .unwrap_or_default();
-
-        let process = config.process.clone();
-
-        let mounts = config.mounts.clone().unwrap_or_default();
-
         Self {
             config,
             bundle,
-            rootfs,
-            entrypoint,
-            process,
-            mounts,
-            env,
             seed,
             net_mode,
         }
     }
 
+    pub fn config(&self) -> &OciConfig {
+        &self.config
+    }
+
+    pub fn bundle(&self) -> &Path {
+        &self.bundle
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    pub fn net_mode(&self) -> NetMode {
+        self.net_mode
+    }
+
+    pub fn rootfs(&self) -> PathBuf {
+        let root_path = Path::new(&self.config.root.path);
+        if root_path.is_absolute() {
+            root_path.to_path_buf()
+        } else {
+            self.bundle.join(&self.config.root.path)
+        }
+    }
+
+    pub fn entrypoint(&self) -> Option<(&str, &[String])> {
+        let process = self.config.process.as_ref()?;
+        let args = process.args.as_ref()?;
+        let (command, rest) = args.split_first()?;
+        Some((command.as_str(), rest))
+    }
+
+    pub fn env(&self) -> &[String] {
+        self.config
+            .process
+            .as_ref()
+            .and_then(|p| p.env.as_deref())
+            .unwrap_or(&[])
+    }
+
+    pub fn mounts(&self) -> &[Mount] {
+        let empty: &[Mount] = &[];
+        self.config.mounts.as_deref().unwrap_or(empty)
+    }
+
     /// Validate that the runtime inputs derived from the config are usable.
     pub fn validate(&self) -> Result<(), HostError> {
-        if self.entrypoint.is_none() {
+        if self.entrypoint().is_none() {
             return Err(HostError::Config(
                 "no entrypoint: config process.args is missing or empty".into(),
             ));
         }
-        let rootfs = Path::new(&self.rootfs);
+        let rootfs = self.rootfs();
         if !rootfs.exists() {
             return Err(HostError::Config(format!(
                 "rootfs '{}' does not exist",
-                self.rootfs
+                rootfs.display()
             )));
         }
         if !rootfs.is_dir() {
             return Err(HostError::Config(format!(
                 "rootfs '{}' is not a directory",
-                self.rootfs
+                rootfs.display()
             )));
         }
         Ok(())
     }
 
-    /// `run`: create, start, supervise to completion. Runs in the foreground;
-    /// returns the container exit code. The state directory (including the
-    /// execution trace) is preserved for `delete`/replay.
+    /// `run`: create, start, supervise to completion.
     pub fn run(&self, state_root: &Path, id: &str) -> Result<i32, HostError> {
         self.validate()?;
         state::init_container_dir(state_root, id)?;
         state::reset_trace(state_root, id);
 
         let (child, relays) = self.spawn_created()?;
-        let _ = cgroup::apply_limits(child, id, &self.config);
+        if let Err(e) = cgroup::apply_limits(child, id, &self.config) {
+            warn!(?e, container = id, "cgroup limits could not be fully applied");
+        }
 
         let mut st = self.mk_state(state_root, id, Status::Running, child, None);
         state::write_state(&st, state_root)?;
@@ -222,9 +223,7 @@ impl Host {
         Ok(code)
     }
 
-    /// `create`: spawn the container into fresh namespaces and pause it at the
-    /// syscall boundary. A daemon supervisor owns the container; this returns
-    /// the container PID once it reports the `created` state.
+    /// `create`: spawn the container into fresh namespaces and pause it.
     pub fn create(&self, state_root: &Path, id: &str) -> Result<Pid, HostError> {
         self.validate()?;
         state::init_container_dir(state_root, id)?;
@@ -277,8 +276,6 @@ impl Host {
         }
     }
 
-    /// The daemonised supervisor: spawn the container, report `created`, then
-    /// block until `dtrun start` writes the exec FIFO.
     fn supervisor_created(
         &self,
         state_root: &Path,
@@ -293,7 +290,6 @@ impl Host {
         Ok((child, relays))
     }
 
-    /// Wait for `dtrun start`, then supervise the container to completion.
     fn supervisor_wait_and_run(
         &self,
         state_root: &Path,
@@ -302,7 +298,6 @@ impl Host {
         relays: RelayHandles,
     ) -> Result<i32, HostError> {
         let fifo = state::exec_fifo(state_root, id);
-        // Block until `dtrun start` writes a byte into the FIFO.
         let f = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -314,7 +309,9 @@ impl Host {
             let _ = reader.read_exact(&mut byte);
         }
 
-        let _ = cgroup::apply_limits(child, id, &self.config);
+        if let Err(e) = cgroup::apply_limits(child, id, &self.config) {
+            warn!(?e, container = id, "cgroup limits could not be fully applied");
+        }
 
         let mut st = match state::read_state(state_root, id) {
             Ok(s) => s,
@@ -328,8 +325,6 @@ impl Host {
         self.supervise_and_finish(state_root, id, child, relays, &mut st)
     }
 
-    /// Common tail: run the deterministic ptrace loop, then record the final
-    /// state and drain any output relays.
     fn supervise_and_finish(
         &self,
         state_root: &Path,
@@ -341,11 +336,10 @@ impl Host {
         let code = supervisor::supervise(child, self.seed, state_root, id)?;
         st.status = Status::Stopped;
         st.exit_code = Some(code);
-        let _ = state::write_state(st, state_root);
+        if let Err(e) = state::write_state(st, state_root) {
+            warn!(?e, container = id, "failed to update state to stopped");
+        }
 
-        // Drain the output relays and append their lines to the trace after
-        // the syscall stream, so the trace file is independent of scheduler
-        // races between the relay threads and the supervisor.
         let mut captured: Vec<Vec<String>> = Vec::with_capacity(relays.len());
         for handle in relays {
             captured.push(handle.join().unwrap_or_default());
@@ -371,89 +365,48 @@ impl Host {
         Ok(code)
     }
 
-    /// Build a state record for this container.
     fn mk_state(
         &self,
-        state_root: &Path,
+        _state_root: &Path,
         id: &str,
         status: Status,
         pid: Pid,
         exit_code: Option<i32>,
     ) -> ContainerState {
-        let _ = state_root;
         ContainerState {
             oci_version: self.config.oci_version.clone(),
             id: id.to_owned(),
             status,
             pid: pid.as_raw(),
             bundle: self.bundle.to_string_lossy().into_owned(),
-            rootfs: self.rootfs.clone(),
+            rootfs: self.rootfs().to_string_lossy().into_owned(),
             seed: self.seed,
             exit_code,
             created: state::now_rfc3339(),
         }
     }
 
-    /// Clone a child into fresh namespaces, jail it into the rootfs, pause it
-    /// at the first ptrace stop, and arm the supervisor options.
     fn spawn_created(&self) -> Result<(Pid, RelayHandles), HostError> {
-        let Some((command, args)) = self.entrypoint.clone() else {
+        if self.entrypoint().is_none() {
             return Err(HostError::Config("no entrypoint".into()));
-        };
+        }
 
-        let rootfs = self.rootfs.clone();
-        let mounts = self.mounts.clone();
-        let hostname = self.config.hostname.clone();
-        let cwd = self
-            .process
-            .as_ref()
-            .and_then(|p| p.cwd.clone())
-            .unwrap_or_else(|| "/".to_owned());
-        let readonly = self.config.root.readonly.unwrap_or(false);
-        let env = self.env.clone();
+        let rootfs = self.rootfs();
         let net_mode = self.net_mode;
-        let devices = self
-            .config
-            .linux
-            .as_ref()
-            .and_then(|l| l.devices.clone())
-            .unwrap_or_default();
-        let sysctls: Vec<(String, String)> = self
-            .config
-            .linux
-            .as_ref()
-            .and_then(|l| l.sysctl.clone())
-            .map(|m| m.into_iter().collect())
-            .unwrap_or_default();
-        let masked_paths = self
-            .config
-            .linux
-            .as_ref()
-            .and_then(|l| l.masked_paths.clone())
-            .unwrap_or_default();
-        let readonly_paths = self
-            .config
-            .linux
-            .as_ref()
-            .and_then(|l| l.readonly_paths.clone())
-            .unwrap_or_default();
-        let oom_score_adj = self.process.as_ref().and_then(|p| p.oom_score_adj);
-        let capabilities = self.process.as_ref().and_then(|p| p.capabilities.clone());
-        let uid_mappings = self
-            .config
-            .linux
-            .as_ref()
-            .and_then(|l| l.uid_mappings.clone())
-            .unwrap_or_default();
-        let gid_mappings = self
-            .config
-            .linux
-            .as_ref()
-            .and_then(|l| l.gid_mappings.clone())
-            .unwrap_or_default();
+        let config = &self.config;
 
-        // Sync pipes: child->parent (child has unshared) and parent->child
-        // (id mappings are written). Keeps the id-map writes race-free.
+        let empty_mappings: Vec<LinuxIdMapping> = Vec::new();
+        let uid_mappings = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.uid_mappings.as_deref())
+            .unwrap_or(&empty_mappings);
+        let gid_mappings = config
+            .linux
+            .as_ref()
+            .and_then(|l| l.gid_mappings.as_deref())
+            .unwrap_or(&empty_mappings);
+
         let (child_ready_r, child_ready_w) =
             pipe2(OFlag::O_CLOEXEC).map_err(|e| HostError::Errno("child_ready pipe", e))?;
         let (maps_done_r, maps_done_w) =
@@ -465,138 +418,15 @@ impl Host {
 
         let mut stack = vec![0u8; STACK_SIZE];
         let cb: Box<dyn FnMut() -> isize> = Box::new(move || {
-            let _ = write(&child_ready_w, b"x");
-            let mut ack = [0u8; 1];
-            let _ = read(&maps_done_r, &mut ack);
-
-            if let Err(e) = make_root_private() {
-                error!("remount / as private failed: {e}");
-                return 1;
-            }
-
-            if let Some(name) = hostname.clone()
-                && let Err(e) = sethostname(name)
-            {
-                warn!("sethostname failed: {e}");
-            }
-
-            // Bring up loopback in a fresh network namespace. In host mode the
-            // container shares the host netns, so the host loopback already
-            // exists and is up.
-            if net_mode == NetMode::None
-                && let Err(e) = net::bring_up_loopback()
-            {
-                warn!("bringing up loopback failed: {e}");
-            }
-
-            // Open the host's device nodes before chroot so they can be
-            // bind-mounted into the container's `/dev` (mknod(2) is forbidden
-            // inside a user namespace). O_PATH avoids requiring read/write
-            // access to each node (`/dev/tty`, for example, can only be
-            // opened read/write by a process with a controlling terminal.
-            // Both the OCI default devices and any `linux.devices` entries are
-            // bound in this way, so the two lists are combined here.
-            let mut host_devices: Vec<(String, OwnedFd)> =
-                ["null", "zero", "full", "random", "urandom", "tty"]
-                    .iter()
-                    .filter_map(|name| {
-                        let path = format!("/dev/{name}");
-                        let c = std::ffi::CString::new(path.as_str()).ok()?;
-                        // O_PATH: no read/write permission needed (e.g. /dev/tty
-                        // can only be opened read/write by a controlling
-                        // terminal). bind_mount resolves the node via
-                        // /proc/self/fd, so the fd need never be I/O'd.
-                        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-                        if fd < 0 {
-                            None
-                        } else {
-                            use std::os::fd::FromRawFd;
-                            Some((path, unsafe { OwnedFd::from_raw_fd(fd) }))
-                        }
-                    })
-                    .collect();
-            for device in &devices {
-                let c = std::ffi::CString::new(device.path.as_str()).ok();
-                let Some(c) = c else { continue };
-                let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-                if fd < 0 {
-                    tracing::debug!(path = %device.path, "configured device not found on host");
-                    continue;
-                }
-                use std::os::fd::FromRawFd;
-                host_devices.push((device.path.clone(), unsafe { OwnedFd::from_raw_fd(fd) }));
-            }
-
-            if let Err(e) = chroot(rootfs.as_str()) {
-                error!("chroot({rootfs}) failed: {e}");
-                return 1;
-            }
-            if let Err(e) = chdir(cwd.as_str()) {
-                error!("chdir({cwd}) failed: {e}");
-                return 1;
-            }
-
-            for mount in &mounts {
-                if let Err(e) = apply_mount(mount) {
-                    warn!(dest = %mount.destination, "mount failed: {e}");
-                }
-            }
-
-            setup_default_devices(&host_devices);
-
-            // Apply the remaining `linux.*` isolation features now that the
-            // container's mounts exist. Each operation is allowed because the
-            // child holds CAP_SYS_ADMIN in its own user namespace.
-            if net_mode != NetMode::Host {
-                for (key, value) in &sysctls {
-                    let path = format!("/proc/sys/{}", key.replace('.', "/"));
-                    if let Err(e) = std::fs::write(&path, value) {
-                        warn!(sysctl = %key, ?e, "sysctl write failed");
-                    }
-                }
-            }
-            apply_masked_paths(&masked_paths);
-            apply_readonly_paths(&readonly_paths);
-
-            if let Some(adj) = oom_score_adj
-                && let Err(e) = apply_oom_score_adj(adj)
-            {
-                warn!(?e, "oom_score_adj write failed");
-            }
-            if let Some(caps) = &capabilities
-                && let Err(e) = apply_capabilities(caps)
-            {
-                warn!(?e, "capability setup failed");
-            }
-
-            if readonly && let Err(e) = make_root_readonly() {
-                warn!("readonly root remount failed: {e}");
-            }
-
-            // Route the container's stdout/stderr into the capture pipes.
-            let _ = dup2_stdout(&stdout_w);
-            let _ = dup2_stderr(&stderr_w);
-
-            // Freeze at the first stop until `dtrun start` (or `run`) releases
-            // the container. Hand control of every syscall to the supervisor.
-            if let Err(e) = ptrace::traceme() {
-                error!("ptrace TRACEME failed: {e}");
-                return 1;
-            }
-            unsafe { libc::raise(libc::SIGSTOP) };
-
-            // Disable ASLR so the workload's address layout is deterministic
-            // across runs; the supervisor also receives every mmap, but with
-            // randomized base addresses the allocator's munmap-vs-mprotect
-            // decisions vary. `personality` survives the exec below.
-            match personality::get() {
-                Ok(pers) => {
-                    let _ = personality::set(pers | Persona::ADDR_NO_RANDOMIZE);
-                }
-                Err(e) => warn!(?e, "could not disable ASLR"),
-            }
-
-            exec_entrypoint(&command, &args, &env)
+            setup_and_exec_child(
+                config,
+                &rootfs,
+                net_mode,
+                &child_ready_w,
+                &maps_done_r,
+                &stdout_w,
+                &stderr_w,
+            )
         });
 
         let child = unsafe {
@@ -608,11 +438,9 @@ impl Host {
         }
         .map_err(HostError::Clone)?;
 
-        // The child is now in its own user namespace. Write the id mappings,
-        // then let it proceed.
         let mut ready = [0u8; 1];
         let _ = read(&child_ready_r, &mut ready);
-        map_root_user(child, &uid_mappings, &gid_mappings)
+        map_root_user(child, uid_mappings, gid_mappings)
             .map_err(|e| HostError::Config(format!("user namespace setup failed: {e}")))?;
         let _ = write(&maps_done_w, b"x");
 
@@ -621,7 +449,6 @@ impl Host {
             thread::spawn(relay_lines(stderr_r, false)),
         ];
 
-        // Wait for the child's initial ptrace stop (its SIGSTOP).
         let status = waitpid(child, Some(WaitPidFlag::__WALL | WaitPidFlag::WUNTRACED))
             .map_err(HostError::Wait)?;
         match status {
@@ -649,8 +476,6 @@ impl Host {
     }
 }
 
-/// Detach from the terminal: new session and stdio redirected to /dev/null so
-/// the supervisor outlives `dtrun create`.
 fn daemonize() {
     unsafe {
         libc::setsid();
@@ -669,9 +494,6 @@ fn daemonize() {
     }
 }
 
-/// Relay one of the container's output streams into tracing for the live
-/// display, returning the captured lines in stream order for the supervisor to
-/// append to the trace deterministically.
 fn relay_lines(fd: OwnedFd, is_stdout: bool) -> impl FnOnce() -> Vec<String> {
     move || {
         let mut reader = BufReader::new(File::from(fd));
@@ -697,300 +519,5 @@ fn relay_lines(fd: OwnedFd, is_stdout: bool) -> impl FnOnce() -> Vec<String> {
             }
         }
         captured
-    }
-}
-
-/// `dtrun start`: release a created container by writing the exec FIFO.
-pub fn start_container(state_root: &Path, id: &str) -> Result<(), HostError> {
-    let st = state::read_state(state_root, id)?;
-    if st.status != Status::Created {
-        return Err(HostError::NotCreated);
-    }
-    let fifo = state::exec_fifo(state_root, id);
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&fifo)
-        .map_err(HostError::Io)?;
-    f.write_all(b"x").map_err(HostError::Io)?;
-    Ok(())
-}
-
-/// `dtrun kill`: send a signal to the container's init process.
-pub fn kill_container(state_root: &Path, id: &str, sig: &str) -> Result<(), HostError> {
-    let st = state::read_state(state_root, id)?;
-    if st.pid <= 0 {
-        return Err(HostError::NotFound);
-    }
-    let signal = parse_signal(sig)?;
-    kill(Pid::from_raw(st.pid), signal).map_err(|e| HostError::Errno("kill", e))?;
-    Ok(())
-}
-
-/// `dtrun delete`: remove container state, optionally killing a live container.
-pub fn delete_container(state_root: &Path, id: &str, force: bool) -> Result<(), HostError> {
-    let st = state::read_state(state_root, id)?;
-    if st.status != Status::Stopped && !force {
-        return Err(HostError::Config(format!(
-            "container '{}' is still running (use --force)",
-            id
-        )));
-    }
-    if force && st.pid > 0 {
-        let _ = kill(Pid::from_raw(st.pid), Signal::SIGKILL);
-    }
-    state::remove_state(state_root, id)?;
-    Ok(())
-}
-
-/// `dtrun state`: print the container state as JSON.
-pub fn print_state(state_root: &Path, id: &str) -> Result<(), HostError> {
-    let st = state::read_state(state_root, id)?;
-    let json = serde_json::to_string_pretty(&st).map_err(|e| HostError::Config(e.to_string()))?;
-    info!(id, state = %json, "state");
-    Ok(())
-}
-
-/// `dtrun list`: list containers known to the runtime.
-pub fn list_containers(state_root: &Path, format: &str) -> Result<(), HostError> {
-    let ids = state::list_ids(state_root);
-    let rows: Vec<serde_json::Value> = ids
-        .iter()
-        .filter_map(|id| state::read_state(state_root, id).ok())
-        .map(|st| {
-            serde_json::json!({
-                "id": st.id,
-                "pid": st.pid,
-                "status": st.status.as_str(),
-                "bundle": st.bundle,
-                "rootfs": st.rootfs,
-                "seed": st.seed,
-            })
-        })
-        .collect();
-
-    match format {
-        "json" => {
-            let json = serde_json::to_string_pretty(&rows)
-                .map_err(|e| HostError::Config(e.to_string()))?;
-            info!(containers = %json, "list");
-        }
-        _ => {
-            let mut table = format!("{:<24} {:<9} {:<8} {:<6}\n", "ID", "STATUS", "PID", "SEED");
-            for row in &rows {
-                table.push_str(&format!(
-                    "{:<24} {:<9} {:<8} {:<6}\n",
-                    row["id"].as_str().unwrap_or(""),
-                    row["status"].as_str().unwrap_or(""),
-                    row["pid"].as_i64().unwrap_or(0),
-                    row["seed"].as_i64().unwrap_or(0),
-                ));
-            }
-            info!(containers = %table, "list");
-        }
-    }
-    Ok(())
-}
-
-/// `dtrun exec`: run a command inside the container's namespaces.
-pub fn exec_in_container(
-    state_root: &Path,
-    id: &str,
-    command: &[String],
-    cwd: Option<&str>,
-    env: &[String],
-) -> Result<i32, HostError> {
-    let st = state::read_state(state_root, id)?;
-    if st.pid <= 0 || st.status == Status::Stopped {
-        return Err(HostError::Config("container is not running".into()));
-    }
-    let _ = state_root;
-
-    let pid = st.pid;
-    let rootfs = st.rootfs.clone();
-    let cwd = cwd.unwrap_or("/").to_owned();
-
-    // Open the target rootfs directory before joining the mount namespace,
-    // since the host path is not visible from inside the container.
-    let rootfd = unsafe {
-        let path = match CString::new(rootfs.clone()) {
-            Ok(p) => p,
-            Err(e) => return Err(HostError::Config(format!("rootfs path: {e}"))),
-        };
-        libc::open(
-            path.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if rootfd < 0 {
-        return Err(HostError::Errno("open rootfs", Errno::last()));
-    }
-
-    match unsafe { fork() }.map_err(|e| HostError::Errno("fork", e))? {
-        ForkResult::Parent { child } => {
-            let status = waitpid(child, None).map_err(HostError::Wait)?;
-            Ok(match status {
-                WaitStatus::Exited(_p, code) => code,
-                WaitStatus::Signaled(_p, sig, _) => 128 + sig as i32,
-                _ => 1,
-            })
-        }
-        ForkResult::Child => {
-            // Join the container's namespaces: user first, then the rest.
-            enter_ns(pid, "user")?;
-            enter_ns(pid, "mnt")?;
-            enter_ns(pid, "net")?;
-            enter_ns(pid, "ipc")?;
-            enter_ns(pid, "uts")?;
-            enter_ns(pid, "pid")?;
-
-            // Entering a PID namespace takes effect on the next fork.
-            match unsafe { fork() }.map_err(|e| HostError::Errno("fork", e))? {
-                ForkResult::Child => {
-                    unsafe {
-                        libc::fchdir(rootfd);
-                        let dot = std::ffi::CString::new(".").expect("no NUL in '.'");
-                        libc::chroot(dot.as_ptr());
-                        let cwd_c =
-                            CString::new(cwd).unwrap_or_else(|_| CString::new("/").unwrap());
-                        libc::chdir(cwd_c.as_ptr());
-                    }
-
-                    let mut c_env: Vec<CString> = std::env::vars()
-                        .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
-                        .collect();
-                    for kv in env {
-                        if let Ok(c) = CString::new(kv.clone()) {
-                            c_env.push(c);
-                        }
-                    }
-
-                    let cargs: Vec<CString> = command
-                        .iter()
-                        .filter_map(|a| CString::new(a.clone()).ok())
-                        .collect();
-                    if cargs.is_empty() {
-                        unsafe { libc::_exit(127) };
-                    }
-
-                    match execvpe(&cargs[0], &cargs, &c_env) {
-                        Ok(never) => match never {},
-                        Err(e) => {
-                            error!("exec failed: {e}");
-                            unsafe { libc::_exit(127) }
-                        }
-                    }
-                }
-                ForkResult::Parent { child } => {
-                    let status =
-                        waitpid(child, Some(WaitPidFlag::__WALL)).map_err(HostError::Wait)?;
-                    let code = match status {
-                        WaitStatus::Exited(_p, code) => code,
-                        WaitStatus::Signaled(_p, sig, _) => 128 + sig as i32,
-                        _ => 1,
-                    };
-                    unsafe { libc::_exit(code) }
-                }
-            }
-        }
-    }
-}
-
-/// `setns(2)` into one of the container's namespaces via `/proc/<pid>/ns/<ns>`.
-fn enter_ns(pid: i32, ns: &str) -> Result<(), HostError> {
-    let path = format!("/proc/{pid}/ns/{ns}");
-    let f = std::fs::File::open(&path).map_err(HostError::Io)?;
-    let flags = match ns {
-        "user" => CloneFlags::CLONE_NEWUSER,
-        "mnt" => CloneFlags::CLONE_NEWNS,
-        "pid" => CloneFlags::CLONE_NEWPID,
-        "net" => CloneFlags::CLONE_NEWNET,
-        "ipc" => CloneFlags::CLONE_NEWIPC,
-        "uts" => CloneFlags::CLONE_NEWUTS,
-        _ => CloneFlags::empty(),
-    };
-    setns(f, flags).map_err(|e| HostError::Errno("setns", e))
-}
-
-/// Parse a signal name (e.g. "SIGTERM", "TERM", "9") into a [`Signal`].
-fn parse_signal(sig: &str) -> Result<Signal, HostError> {
-    let s = sig.trim().to_uppercase();
-    let s = s.strip_prefix("SIG").unwrap_or(&s);
-    if let Ok(n) = s.parse::<i32>() {
-        if let Ok(signal) = Signal::try_from(n) {
-            return Ok(signal);
-        }
-        return Err(HostError::BadSignal(sig.into()));
-    }
-    let candidates = [
-        Signal::SIGHUP,
-        Signal::SIGINT,
-        Signal::SIGQUIT,
-        Signal::SIGILL,
-        Signal::SIGTRAP,
-        Signal::SIGABRT,
-        Signal::SIGBUS,
-        Signal::SIGFPE,
-        Signal::SIGKILL,
-        Signal::SIGUSR1,
-        Signal::SIGSEGV,
-        Signal::SIGUSR2,
-        Signal::SIGPIPE,
-        Signal::SIGALRM,
-        Signal::SIGTERM,
-        Signal::SIGSTKFLT,
-        Signal::SIGCHLD,
-        Signal::SIGCONT,
-        Signal::SIGSTOP,
-        Signal::SIGTSTP,
-        Signal::SIGTTIN,
-        Signal::SIGTTOU,
-        Signal::SIGURG,
-        Signal::SIGXCPU,
-        Signal::SIGXFSZ,
-        Signal::SIGVTALRM,
-        Signal::SIGPROF,
-        Signal::SIGWINCH,
-        Signal::SIGIO,
-        Signal::SIGPWR,
-        Signal::SIGSYS,
-    ];
-    candidates
-        .iter()
-        .copied()
-        .find(|signal| signal.as_str() == format!("SIG{s}"))
-        .ok_or_else(|| HostError::BadSignal(sig.into()))
-}
-
-/// Build the C argv for the entrypoint, failing on any NUL byte.
-fn build_c_args(command: &str, args: &[String]) -> Option<Vec<CString>> {
-    let c_command = CString::new(command).ok()?;
-    let mut out = Vec::with_capacity(args.len() + 1);
-    out.push(c_command);
-    for a in args {
-        out.push(CString::new(a.clone()).ok()?);
-    }
-    Some(out)
-}
-
-/// exec the container entrypoint with its args and environment.
-/// Only returns on failure.
-fn exec_entrypoint(command: &str, args: &[String], env: &[String]) -> isize {
-    let Some(c_args) = build_c_args(command, args) else {
-        error!("entrypoint or an argument contains a NUL byte");
-        return 1;
-    };
-
-    let c_env: Vec<CString> = env
-        .iter()
-        .filter_map(|kv| CString::new(kv.clone()).ok())
-        .collect();
-
-    match execvpe(&c_args[0], &c_args, &c_env) {
-        Err(e) => {
-            error!("execvpe failed: {e}");
-            1
-        }
-        Ok(_) => 1,
     }
 }

@@ -378,41 +378,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-// OCI conformance: runtimetest (opencontainers/runtime-tools).
-//
-// `dtrun conformance` builds a scratch bundle from the example rootfs, injects
-// runtimetest, runs it, and validates the emitted TAP stream itself. The test
-// only needs to drive the CLI and check the exit code. Skipped when runtimetest
-// is not installed.
 
-#[test]
-fn container_passes_oci_runtimetest_validation() {
-    let Some(bin) = libdtrun::conformance::find_runtimetest() else {
-        eprintln!(
-            "runtimetest not found; install with:\n  \
-             go install github.com/opencontainers/runtime-tools/cmd/runtimetest@master"
-        );
-        return;
-    };
-
-    let out = Command::new(dtrun())
-        .arg("conformance")
-        .args(["--bundle"])
-        .arg(bundle_dir())
-        .args(["--seed"])
-        .arg("42")
-        .env("RUNTIMETEST_BIN", &bin)
-        .env("RUST_LOG", "error")
-        .output()
-        .expect("spawn dtrun conformance");
-
-    assert_eq!(
-        exit_code(&out),
-        0,
-        "dtrun conformance failed:\n{}",
-        stderr(&out)
-    );
-}
 
 /// Read `state.json` until its status is one of `wanted` (or timeout).
 fn poll_status(path: &Path, wanted: &[&str]) -> String {

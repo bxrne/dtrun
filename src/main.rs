@@ -1,44 +1,54 @@
 use clap::Parser;
 use std::fmt::Display;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use libdtrun::cli::{Cli, Commands, CreateArgs, FlattenArgs, RunArgs};
+use libdtrun::cli::{Cli, Commands, FlattenArgs};
 use libdtrun::oci::config::OciConfig;
 use libdtrun::oci::image;
 use libdtrun::runtime::{Host, NetMode, host};
 
-fn main() {
-    let cli = Cli::parse();
-
+// Initialize tracing with optional log file path.
+fn init_tracing(log_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let log_path = cli.log.clone();
     let fmt = tracing_subscriber::fmt().json().with_env_filter(filter);
     let fmt = fmt.with_writer(move || -> Box<dyn std::io::Write + Send> {
         match &log_path {
-            Some(path) => {
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .expect("failed to open log file");
-                Box::new(f)
-            }
+            Some(path) => match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                Ok(f) => Box::new(f),
+                Err(e) => {
+                    eprintln!("failed to open log file {path:?}: {e}; falling back to stderr");
+                    Box::new(std::io::stderr())
+                }
+            },
             None => Box::new(std::io::stderr()),
         }
     });
     fmt.init();
+    Ok(())
+}
 
-    let root = cli.root_dir();
+fn main() {
+    let cli = Cli::parse();
+
+    match init_tracing(cli.log.clone()) {
+        Err(e) => {
+            error!("failed to initialize tracing: {e}");
+            std::process::exit(1);
+        }
+        Ok(()) => {}
+    }
+
+    let root: &Path = &cli.root_dir();
     let code = match &cli.command {
         Commands::Create(args) => {
-            let cli: &Cli = &cli;
-            let root: &Path = &root;
-            let args: &CreateArgs = args;
-            let bundle = args.bundle.bundle.clone();
-            let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
+            let host = match load_host(&args.bundle.bundle, cli.seed, &args.bundle.net) {
                 Ok(h) => h,
                 Err(e) => std::process::exit(fail(e)),
             };
@@ -52,23 +62,15 @@ fn main() {
                 Err(e) => fail(e),
             }
         }
-        Commands::Start(args) => {
-            let root: &Path = &root;
-            let id: &str = &args.id;
-            match host::start_container(root, id) {
-                Ok(()) => {
-                    info!(id, "started");
-                    0
-                }
-                Err(e) => fail(e),
+        Commands::Start(args) => match host::start_container(root, args.id.as_str()) {
+            Ok(()) => {
+                info!(id = %args.id, "started");
+                0
             }
-        }
+            Err(e) => fail(e),
+        },
         Commands::Run(args) => {
-            let cli: &Cli = &cli;
-            let root: &Path = &root;
-            let args: &RunArgs = args;
-            let bundle = args.bundle.bundle.clone();
-            let host = match load_host(&bundle, cli.seed, &args.bundle.net) {
+            let host = match load_host(&args.bundle.bundle, cli.seed, &args.bundle.net) {
                 Ok(h) => h,
                 Err(e) => std::process::exit(fail(e)),
             };
@@ -80,18 +82,13 @@ fn main() {
                 Err(e) => fail(e),
             }
         }
-        Commands::Kill(args) => {
-            let root: &Path = &root;
-            let id: &str = &args.id;
-            let signal: &str = &args.signal;
-            match host::kill_container(root, id, signal) {
-                Ok(()) => {
-                    info!(id, signal, "signal sent");
-                    0
-                }
-                Err(e) => fail(e),
+        Commands::Kill(args) => match host::kill_container(root, &args.id, &args.signal) {
+            Ok(()) => {
+                info!(id = %args.id, signal = %args.signal, "killed");
+                0
             }
-        }
+            Err(e) => fail(e),
+        },
         Commands::Delete(args) => {
             let root: &Path = &root;
             let id: &str = &args.id;
@@ -160,29 +157,6 @@ fn main() {
                         "flattened image deterministically"
                     );
                     0
-                }
-                Err(e) => fail(e),
-            }
-        }
-        Commands::Conformance(args) => {
-            let cli: &Cli = &cli;
-            match libdtrun::conformance::run(&args.bundle, cli.seed, args.keep) {
-                Ok(summary) => {
-                    info!(
-                        total = summary.total,
-                        pass = summary.pass,
-                        skip = summary.skip,
-                        fail = summary.fail,
-                        "runtimetest conformance summary"
-                    );
-                    if summary.fail > 0 {
-                        for failure in &summary.failures {
-                            error!("{failure}");
-                        }
-                        1
-                    } else {
-                        0
-                    }
                 }
                 Err(e) => fail(e),
             }

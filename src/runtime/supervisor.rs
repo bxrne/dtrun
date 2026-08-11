@@ -601,11 +601,8 @@ impl Supervisor {
         let (flags, child_tid) = if nr == libc::SYS_clone3 {
             match read_proc_mem(p, regs.rdi, 24).map_err(SuperviseError::Io) {
                 // struct clone_args: flags@0, pidfd@8, child_tid@16.
-                Ok(buf) => (
-                    u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-                    u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-                ),
-                Err(_) => (0, 0),
+                Ok(buf) if buf.len() == 24 => (le_u64(&buf[..8]), le_u64(&buf[16..24])),
+                Ok(_) | Err(_) => (0, 0),
             }
         } else {
             // clone(flags, stack, parent_tid, child_tid, tls): rdi..r10.
@@ -836,7 +833,21 @@ fn read_proc_mem(pid: Pid, addr: u64, len: usize) -> std::io::Result<Vec<u8>> {
 
 fn read_u32(pid: Pid, addr: u64) -> std::io::Result<u32> {
     let buf = read_proc_mem(pid, addr, 4)?;
-    Ok(u32::from_le_bytes(buf.try_into().unwrap()))
+    Ok(le_u32(&buf))
+}
+
+fn le_u64(bytes: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = bytes.len().min(8);
+    b[..n].copy_from_slice(&bytes[..n]);
+    u64::from_le_bytes(b)
+}
+
+fn le_u32(bytes: &[u8]) -> u32 {
+    let mut b = [0u8; 4];
+    let n = bytes.len().min(4);
+    b[..n].copy_from_slice(&bytes[..n]);
+    u32::from_le_bytes(b)
 }
 
 /// Human-readable name for a syscall number (best effort; falls back to `nr`).

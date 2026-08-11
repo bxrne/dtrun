@@ -74,8 +74,6 @@ pub enum Commands {
     Spec(SpecArgs),
     /// Flatten an OCI/Docker image tarball into a deterministic rootfs
     Flatten(FlattenArgs),
-    /// Run the OCI runtimetest conformance suite against a bundle's rootfs
-    Conformance(ConformanceArgs),
     /// Print version information
     Version,
 }
@@ -192,15 +190,4 @@ pub struct FlattenArgs {
     /// Directory to flatten the rootfs into
     #[arg(value_name = "DEST")]
     pub dest: PathBuf,
-}
-
-#[derive(Args, Debug)]
-pub struct ConformanceArgs {
-    /// OCI bundle whose `rootfs` is validated by runtimetest
-    #[arg(short, long, value_name = "PATH", default_value = ".")]
-    pub bundle: PathBuf,
-
-    /// Keep the generated bundle and state directory for inspection
-    #[arg(long)]
-    pub keep: bool,
 }

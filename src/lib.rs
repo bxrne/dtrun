@@ -21,7 +21,6 @@
 //! ```
 
 pub mod cli;
-pub mod conformance;
 pub mod oci;
 pub mod runtime;
 

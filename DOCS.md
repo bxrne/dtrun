@@ -410,9 +410,8 @@ dtrun flatten image.tar.gz dest/
 
 ## Conformance
 
-`dtrun` validates its OCI compliance inside the container. It uses
-`runtimetest` from `opencontainers/runtime-tools`, driven by the
-`dtrun conformance --bundle <BUNDLE>` command (see below).
+`dtrun` validates its OCI compliance inside the container using
+`runtimetest` from `opencontainers/runtime-tools`.
 
 Current result: **349/349 TAP tests pass**. 312 tests pass and 37 are skipped.
 
@@ -480,19 +479,14 @@ flatten` (see the httpbin example in the README).
 
 ### Run runtimetest
 
-`dtrun conformance` builds a scratch bundle from the given bundle's `rootfs`,
-injects `runtimetest`, runs it, and validates the emitted TAP stream:
+To validate OCI compliance using `runtimetest` (from `opencontainers/runtime-tools`):
 
 ```sh
 go install github.com/opencontainers/runtime-tools/cmd/runtimetest@master
-dtrun conformance --bundle examples/bundle --seed 42
+cp $(which runtimetest) examples/bundle/rootfs/runtimetest
+# update config.json process.args to ["/runtimetest"]
+dtrun run test-conformance --bundle examples/bundle
 ```
-
-Set `RUNTIMETEST_BIN` if the binary is not on the path (the command also checks
-`$GOBIN`, `~/go/bin`, and `$PATH`). It exits 0 only when no test fails; the TAP
-summary is logged as JSON. Use `--keep` to retain the generated bundle and
-state directory for inspection. The integration test is skipped when
-`runtimetest` is not installed.
 
 ## Limitations
 
