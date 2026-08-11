@@ -1,7 +1,7 @@
 //! Deterministic OCI/Docker image flattening.
 //!
-//! Container images carry host-specific metadata — creation timestamps,
-//! ownership, setuid bits — that leaks nondeterminism into a fresh run. This
+//! Container images carry host-specific metadata (creation timestamps,
+//! ownership, setuid bits) that leaks nondeterminism into a fresh run. This
 //! module flattens an OCI/Docker layer tarball into a rootfs with normalized
 //! metadata: every file gets mtime 0, a canonical mode, ownership of 0:0 where
 //! permitted, and the whiteout semantics of a Docker layer are honoured.

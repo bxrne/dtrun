@@ -1,7 +1,7 @@
 //! Integration tests: every fixture under `examples/config/good` must parse,
 //! and every fixture under `examples/config/bad` must fail.
 
-use dtrun::oci::config::OciConfig;
+use libdtrun::oci::config::OciConfig;
 use std::fs;
 use std::path::{Path, PathBuf};
 

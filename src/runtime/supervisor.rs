@@ -1,7 +1,7 @@
 //! Deterministic supervisor: drives the container under `PTRACE_SYSCALL`,
 //! intercepting the sources of nondeterminism the kernel exposes to the
-//! workload — randomness (`getrandom`), wall/monotonic time (`clock_gettime`,
-//! `gettimeofday`) — and, for multi-threaded workloads, the scheduling of
+//! workload: randomness (`getrandom`), wall/monotonic time (`clock_gettime`,
+//! `gettimeofday`), and, for multi-threaded workloads, the scheduling of
 //! threads and the futexes they synchronise on.
 //!
 //! Threads are run one at a time in FIFO round-robin order and are switched

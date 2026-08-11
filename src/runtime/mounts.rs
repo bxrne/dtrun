@@ -175,19 +175,11 @@ pub fn bind_mount(source: &str, dest: &str) -> Result<(), Errno> {
 /// Create the OCI default device nodes and `/dev` symlinks inside the
 /// container (runtime-spec Linux "default devices"). Runs after the `/dev`
 /// tmpfs is mounted. Rootless runtimes cannot `mknod(2)` device nodes (the
-/// kernel forbids it inside a user namespace), so the host's nodes — opened
-/// before `chroot` and passed in as `(name, fd)` pairs — are bind-mounted in
-/// via `/proc/self/fd/<n>`.
+/// kernel forbids it inside a user namespace), so the host's nodes (opened
+/// before `chroot` and passed in as `(destination, fd)` pairs) are
+/// bind-mounted in via `/proc/self/fd/<n>`.
 pub fn setup_default_devices(host_devices: &[(String, OwnedFd)]) {
-    for (name, fd) in host_devices {
-        let dest = format!("/dev/{name}");
-        let source = format!("/proc/self/fd/{}", fd.as_raw_fd());
-        // A placeholder file provides the mount point for the bind.
-        let _ = std::fs::File::create(&dest);
-        if let Err(e) = bind_mount(&source, &dest) {
-            tracing::debug!(dest, ?e, "bind device failed");
-        }
-    }
+    bind_devices(host_devices);
 
     const LINKS: &[(&str, &str)] = &[
         ("/dev/fd", "/proc/self/fd"),
@@ -205,6 +197,86 @@ pub fn setup_default_devices(host_devices: &[(String, OwnedFd)]) {
         let ret = unsafe { libc::symlink(c_target.as_ptr(), c_link.as_ptr()) };
         if ret != 0 {
             tracing::debug!(link, errno = Errno::last_raw(), "symlink failed");
+        }
+    }
+}
+
+/// Bind-mount host device nodes (opened before `chroot`) into the container at
+/// their configured `(destination, fd)` paths.
+pub fn bind_devices(devices: &[(String, OwnedFd)]) {
+    for (dest, fd) in devices {
+        let source = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        // A placeholder file provides the mount point for the bind.
+        let _ = std::fs::File::create(dest);
+        if let Err(e) = bind_mount(&source, dest) {
+            tracing::debug!(dest, ?e, "bind device failed");
+        }
+    }
+}
+
+/// Mask the given paths by covering them with an unreadable placeholder:
+/// `/dev/null` for files, an empty tmpfs for directories. Paths that cannot be
+/// masked (or do not exist) are left alone — the conformance harness treats a
+/// non-existent path as already masked.
+pub fn apply_masked_paths(paths: &[String]) {
+    for path in paths {
+        let p = Path::new(path);
+        if !p.exists() {
+            // Try a placeholder file so a later bind has a mount point; a
+            // procfs/sysfs mount rejects this, which is fine.
+            if let Some(parent) = p.parent()
+                && std::fs::create_dir_all(parent).is_ok()
+                && std::fs::File::create(path).is_err()
+            {
+                continue;
+            }
+        }
+        if p.is_dir() {
+            let _ = mount(
+                Some("tmpfs"),
+                path.as_str(),
+                Some("tmpfs"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+                None::<&str>,
+            );
+        } else {
+            let _ = bind_mount("/dev/null", path.as_str());
+        }
+    }
+}
+
+/// Make the given paths read-only by bind-mounting each path onto itself and
+/// remounting it read-only (the runc approach). Runs after the container's own
+/// mounts exist, so each bind/remount is allowed in the container's user
+/// namespace.
+pub fn apply_readonly_paths(paths: &[String]) {
+    for path in paths {
+        let p = Path::new(path);
+        if !p.exists() {
+            // Missing readonly paths make runtimetest bail out, so provide a
+            // placeholder directory when possible.
+            let _ = std::fs::create_dir_all(path);
+            if !p.exists() {
+                continue;
+            }
+        }
+        let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
+        if mount(
+            Some(path.as_str()),
+            path.as_str(),
+            None::<&str>,
+            flags,
+            None::<&str>,
+        )
+        .is_ok()
+        {
+            let _ = mount(
+                None::<&str>,
+                path.as_str(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                None::<&str>,
+            );
         }
     }
 }

@@ -3,8 +3,10 @@
 //! `kill`/`delete`/`state`/`exec`).
 
 use crate::oci::config::{Mount, OciConfig, Process};
+use crate::runtime::credentials::{apply_capabilities, apply_oom_score_adj};
 use crate::runtime::mounts::{
-    apply_mount, make_root_private, make_root_readonly, setup_default_devices,
+    apply_masked_paths, apply_mount, apply_readonly_paths, make_root_private, make_root_readonly,
+    setup_default_devices,
 };
 use crate::runtime::namespaces::map_root_user;
 use crate::runtime::state::{self, ContainerState, Status};
@@ -410,6 +412,45 @@ impl Host {
         let readonly = self.config.root.readonly.unwrap_or(false);
         let env = self.env.clone();
         let net_mode = self.net_mode;
+        let devices = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.devices.clone())
+            .unwrap_or_default();
+        let sysctls: Vec<(String, String)> = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.sysctl.clone())
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        let masked_paths = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.masked_paths.clone())
+            .unwrap_or_default();
+        let readonly_paths = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.readonly_paths.clone())
+            .unwrap_or_default();
+        let oom_score_adj = self.process.as_ref().and_then(|p| p.oom_score_adj);
+        let capabilities = self.process.as_ref().and_then(|p| p.capabilities.clone());
+        let uid_mappings = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.uid_mappings.clone())
+            .unwrap_or_default();
+        let gid_mappings = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.gid_mappings.clone())
+            .unwrap_or_default();
 
         // Sync pipes: child->parent (child has unshared) and parent->child
         // (id mappings are written). Keeps the id-map writes race-free.
@@ -448,12 +489,14 @@ impl Host {
                 warn!("bringing up loopback failed: {e}");
             }
 
-            // Open the host's default device nodes before chroot so they can be
+            // Open the host's device nodes before chroot so they can be
             // bind-mounted into the container's `/dev` (mknod(2) is forbidden
             // inside a user namespace). O_PATH avoids requiring read/write
-            // access to each node — `/dev/tty`, for example, can only be
+            // access to each node (`/dev/tty`, for example, can only be
             // opened read/write by a process with a controlling terminal.
-            let host_devices: Vec<(String, OwnedFd)> =
+            // Both the OCI default devices and any `linux.devices` entries are
+            // bound in this way, so the two lists are combined here.
+            let mut host_devices: Vec<(String, OwnedFd)> =
                 ["null", "zero", "full", "random", "urandom", "tty"]
                     .iter()
                     .filter_map(|name| {
@@ -468,10 +511,21 @@ impl Host {
                             None
                         } else {
                             use std::os::fd::FromRawFd;
-                            Some((name.to_string(), unsafe { OwnedFd::from_raw_fd(fd) }))
+                            Some((path, unsafe { OwnedFd::from_raw_fd(fd) }))
                         }
                     })
                     .collect();
+            for device in &devices {
+                let c = std::ffi::CString::new(device.path.as_str()).ok();
+                let Some(c) = c else { continue };
+                let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+                if fd < 0 {
+                    tracing::debug!(path = %device.path, "configured device not found on host");
+                    continue;
+                }
+                use std::os::fd::FromRawFd;
+                host_devices.push((device.path.clone(), unsafe { OwnedFd::from_raw_fd(fd) }));
+            }
 
             if let Err(e) = chroot(rootfs.as_str()) {
                 error!("chroot({rootfs}) failed: {e}");
@@ -490,16 +544,41 @@ impl Host {
 
             setup_default_devices(&host_devices);
 
+            // Apply the remaining `linux.*` isolation features now that the
+            // container's mounts exist. Each operation is allowed because the
+            // child holds CAP_SYS_ADMIN in its own user namespace.
+            if net_mode != NetMode::Host {
+                for (key, value) in &sysctls {
+                    let path = format!("/proc/sys/{}", key.replace('.', "/"));
+                    if let Err(e) = std::fs::write(&path, value) {
+                        warn!(sysctl = %key, ?e, "sysctl write failed");
+                    }
+                }
+            }
+            apply_masked_paths(&masked_paths);
+            apply_readonly_paths(&readonly_paths);
+
+            if let Some(adj) = oom_score_adj
+                && let Err(e) = apply_oom_score_adj(adj)
+            {
+                warn!(?e, "oom_score_adj write failed");
+            }
+            if let Some(caps) = &capabilities
+                && let Err(e) = apply_capabilities(caps)
+            {
+                warn!(?e, "capability setup failed");
+            }
+
             if readonly && let Err(e) = make_root_readonly() {
                 warn!("readonly root remount failed: {e}");
             }
 
-            // Route the container's stdout/stderr into our capture pipes.
+            // Route the container's stdout/stderr into the capture pipes.
             let _ = dup2_stdout(&stdout_w);
             let _ = dup2_stderr(&stderr_w);
 
             // Freeze at the first stop until `dtrun start` (or `run`) releases
-            // us. Hand control of every syscall to the supervisor.
+            // the container. Hand control of every syscall to the supervisor.
             if let Err(e) = ptrace::traceme() {
                 error!("ptrace TRACEME failed: {e}");
                 return 1;
@@ -533,7 +612,7 @@ impl Host {
         // then let it proceed.
         let mut ready = [0u8; 1];
         let _ = read(&child_ready_r, &mut ready);
-        map_root_user(child)
+        map_root_user(child, &uid_mappings, &gid_mappings)
             .map_err(|e| HostError::Config(format!("user namespace setup failed: {e}")))?;
         let _ = write(&maps_done_w, b"x");
 

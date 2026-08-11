@@ -24,6 +24,21 @@ jobs:
       - name: Install busybox-static (test rootfs)
         run: sudo apt-get update && sudo apt-get install -y busybox-static
       - name: Build test rootfs
-        run: scripts/build-busybox-rootfs.sh examples/bundle/rootfs
+        # busybox-static provides /bin/busybox. Create a minimal rootfs and a
+        # symlink per applet. `busybox` itself is listed by --list and must not
+        # be replaced with a self-referential symlink (exec would return ELOOP).
+        run: |
+          set -euo pipefail
+          ROOTFS=examples/bundle/rootfs
+          rm -rf "$ROOTFS"
+          mkdir -p "$ROOTFS"/{bin,dev/pts,dev/shm,etc/network,home,proc,root,sys,tmp,usr/bin,usr/sbin,var/spool,var/www}
+          cp /bin/busybox "$ROOTFS/bin/busybox"
+          "$ROOTFS/bin/busybox" --list | grep -v '^busybox$' | \
+            sed "s|^|$ROOTFS/bin/|" | xargs -I{} ln -sf busybox {} 2>/dev/null || true
+      - name: Allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+        # by default. The runtime needs them for its isolation and mount
+        # setup, so lift the restriction before running the suite.
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Test
         run: cargo test --verbose

@@ -2,6 +2,16 @@
 name = "dtrun"
 version = "0.1.0"
 edition = "2024"
+description = "Deterministic OCI container runtime (library + CLI)"
+license = "MIT"
+
+[lib]
+name = "libdtrun"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dtrun"
+path = "src/main.rs"
 
 [dependencies]
 nix = { version= "0.31.3", features = ["personality", "process", "ptrace", "signal", "sched", "mount", "fs", "user", "hostname", "ioctl", "net"]}

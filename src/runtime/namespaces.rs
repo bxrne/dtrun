@@ -1,5 +1,6 @@
 //! User-namespace plumbing: id mappings and credential drops for the container.
 
+use crate::oci::config::LinuxIdMapping;
 use nix::errno::Errno;
 use nix::unistd::Pid;
 use std::fmt;
@@ -36,27 +37,53 @@ pub fn write_id_map(pid: Pid, entry: &str, contents: &[u8]) -> std::io::Result<(
     f.write_all(contents)
 }
 
-/// Map the child (already inside its own user namespace) to uid/gid 0.
+/// Map the child (already inside its own user namespace) to the configured id
+/// mappings, defaulting to a single root mapping to the current user.
 ///
 /// Must run in the *parent*: it writes `/proc/<child>/*` while the child waits.
 /// After this the child is root inside its namespace but remains an
 /// unprivileged user on the host.
-pub fn map_root_user(child: Pid) -> Result<(), NamespaceError> {
+pub fn map_root_user(
+    child: Pid,
+    uid_mappings: &[LinuxIdMapping],
+    gid_mappings: &[LinuxIdMapping],
+) -> Result<(), NamespaceError> {
     let uid = nix::unistd::getuid();
     let gid = nix::unistd::getgid();
+
+    let uid_map: Vec<LinuxIdMapping> = if uid_mappings.is_empty() {
+        vec![LinuxIdMapping {
+            container_id: 0,
+            host_id: uid.as_raw(),
+            size: 1,
+        }]
+    } else {
+        uid_mappings.to_vec()
+    };
+    let gid_map: Vec<LinuxIdMapping> = if gid_mappings.is_empty() {
+        vec![LinuxIdMapping {
+            container_id: 0,
+            host_id: gid.as_raw(),
+            size: 1,
+        }]
+    } else {
+        gid_mappings.to_vec()
+    };
+
     write_id_map(child, "setgroups", b"deny\n")
         .map_err(|e| NamespaceError::IdMap("setgroups".into(), e))?;
-    write_id_map(
-        child,
-        "gid_map",
-        &format!("0 {} 1\n", gid.as_raw()).into_bytes(),
-    )
-    .map_err(|e| NamespaceError::IdMap("gid_map".into(), e))?;
-    write_id_map(
-        child,
-        "uid_map",
-        &format!("0 {} 1\n", uid.as_raw()).into_bytes(),
-    )
-    .map_err(|e| NamespaceError::IdMap("uid_map".into(), e))?;
+    write_id_map(child, "gid_map", &format_mappings(&gid_map).into_bytes())
+        .map_err(|e| NamespaceError::IdMap("gid_map".into(), e))?;
+    write_id_map(child, "uid_map", &format_mappings(&uid_map).into_bytes())
+        .map_err(|e| NamespaceError::IdMap("uid_map".into(), e))?;
     Ok(())
+}
+
+/// Serialize id mappings as the kernel's `<containerID> <hostID> <size>`
+/// format, one line per mapping.
+fn format_mappings(mappings: &[LinuxIdMapping]) -> String {
+    mappings
+        .iter()
+        .map(|m| format!("{} {} {}\n", m.container_id, m.host_id, m.size))
+        .collect()
 }

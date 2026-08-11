@@ -125,6 +125,30 @@ pub struct LinuxResources {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// A single device node the runtime must make available (`linux.devices`).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxDevice {
+    pub path: String,
+    pub r#type: String,
+    pub major: i64,
+    pub minor: i64,
+    pub file_mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+/// One line of a user/group id namespace mapping (`linux.uidMappings` /
+/// `linux.gidMappings`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LinuxIdMapping {
+    #[serde(rename = "containerID")]
+    pub container_id: u32,
+    #[serde(rename = "hostID")]
+    pub host_id: u32,
+    pub size: u32,
+}
+
 /// Platform-specific Linux configuration.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +156,12 @@ pub struct LinuxConfig {
     pub namespaces: Option<Vec<LinuxNamespace>>,
     pub resources: Option<LinuxResources>,
     pub net_devices: Option<HashMap<String, LinuxNetDevice>>,
+    pub devices: Option<Vec<LinuxDevice>>,
+    pub masked_paths: Option<Vec<String>>,
+    pub readonly_paths: Option<Vec<String>>,
+    pub sysctl: Option<HashMap<String, String>>,
+    pub uid_mappings: Option<Vec<LinuxIdMapping>>,
+    pub gid_mappings: Option<Vec<LinuxIdMapping>>,
     /// Remaining linux fields kept as raw JSON so full runtime-spec examples still parse.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -204,6 +234,17 @@ pub struct ProcessUser {
     pub additional_gids: Option<Vec<u32>>,
 }
 
+/// Process capability sets (`process.capabilities`). Each set is a list of
+/// `CAP_*` names as defined by the OCI runtime-spec.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Capabilities {
+    pub bounding: Option<Vec<String>>,
+    pub effective: Option<Vec<String>>,
+    pub inheritable: Option<Vec<String>>,
+    pub permitted: Option<Vec<String>>,
+    pub ambient: Option<Vec<String>>,
+}
+
 /// The container process configuration (`process`).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +254,8 @@ pub struct Process {
     pub cwd: Option<String>,
     pub user: Option<ProcessUser>,
     pub terminal: Option<bool>,
+    pub oom_score_adj: Option<i32>,
+    pub capabilities: Option<Capabilities>,
     /// Remaining process fields kept as raw JSON so full runtime-spec examples still parse.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -443,6 +486,8 @@ mod validate_tests {
                 cwd: Some("/".to_owned()),
                 user: None,
                 terminal: None,
+                oom_score_adj: None,
+                capabilities: None,
                 extra: HashMap::new(),
             }),
             hostname: None,

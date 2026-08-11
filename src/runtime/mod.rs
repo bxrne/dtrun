@@ -2,6 +2,7 @@
 //! supervised child and implements the OCI lifecycle.
 
 pub mod cgroup;
+pub mod credentials;
 pub mod host;
 pub mod mounts;
 pub mod namespaces;

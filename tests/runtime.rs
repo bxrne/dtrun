@@ -358,87 +358,7 @@ fn create_start_lifecycle_transitions_to_stopped() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// OCI conformance: runtimetest (opencontainers/runtime-tools).
-// ---------------------------------------------------------------------------
-
-/// Locate the `runtimetest` binary: `$RUNTIMETEST_BIN`, `~/go/bin`, or the
-/// GOBIN used during development.
-fn runtimetest_bin() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("RUNTIMETEST_BIN") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    for candidate in [
-        std::env::var("GOBIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::home_dir().unwrap_or_default().join("go/bin")),
-        Path::new("/tmp/opencode/gobin").to_path_buf(),
-    ] {
-        let p = candidate.join("runtimetest");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Copy the example rootfs into a scratch bundle and add `runtimetest`.
-fn make_runtimetest_bundle(bin: &Path) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "dtrun-runtimetest-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create runtimetest bundle");
-
-    let rootfs = dir.join("rootfs");
-    let src_rootfs = bundle_dir().join("rootfs");
-    copy_dir(&src_rootfs, &rootfs);
-
-    std::fs::copy(bin, rootfs.join("runtimetest")).expect("copy runtimetest");
-
-    let config = serde_json::json!({
-        "ociVersion": "1.0.0",
-        "root": { "path": "rootfs", "readonly": false },
-        "hostname": "dtrun-runtimetest",
-        "mounts": [
-            { "destination": "/proc", "type": "proc", "source": "proc",
-              "options": ["nosuid", "noexec", "nodev"] },
-            { "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
-              "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] },
-            { "destination": "/dev/pts", "type": "devpts", "source": "devpts",
-              "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"] },
-            { "destination": "/sys", "type": "sysfs", "source": "sysfs",
-              "options": ["nosuid", "noexec", "nodev", "ro"] },
-            { "destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
-              "options": ["nosuid", "noexec", "nodev"] },
-            { "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
-              "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] }
-        ],
-        "process": {
-            "args": ["/runtimetest"],
-            "env": ["PATH=/usr/bin:/bin"],
-            "cwd": "/"
-        }
-    });
-    std::fs::write(
-        dir.join("config.json"),
-        serde_json::to_string_pretty(&config).unwrap(),
-    )
-    .expect("write config.json");
-    // runtimetest reads `config.json` from the container working directory.
-    std::fs::copy(dir.join("config.json"), rootfs.join("config.json")).expect("copy config");
-
-    dir
-}
-
+/// Recursively copy a directory, preserving symlinks.
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).expect("create rootfs");
     for entry in std::fs::read_dir(from).expect("read rootfs") {
@@ -458,30 +378,16 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// Parse the TAP output recorded by runtimetest in the container's trace and
-/// return the lines of every failing test.
-fn tap_failures(trace: &str) -> Vec<String> {
-    trace
-        .lines()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line).ok()?;
-            let event = v["event"].as_str()?;
-            if event != "stdout" {
-                return None;
-            }
-            let text = v["line"].as_str()?;
-            if text.starts_with("not ok") && !text.contains("default device") {
-                Some(text.to_owned())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
+// OCI conformance: runtimetest (opencontainers/runtime-tools).
+//
+// `dtrun conformance` builds a scratch bundle from the example rootfs, injects
+// runtimetest, runs it, and validates the emitted TAP stream itself. The test
+// only needs to drive the CLI and check the exit code. Skipped when runtimetest
+// is not installed.
 
 #[test]
 fn container_passes_oci_runtimetest_validation() {
-    let Some(bin) = runtimetest_bin() else {
+    let Some(bin) = libdtrun::conformance::find_runtimetest() else {
         eprintln!(
             "runtimetest not found; install with:\n  \
              go install github.com/opencontainers/runtime-tools/cmd/runtimetest@master"
@@ -489,36 +395,23 @@ fn container_passes_oci_runtimetest_validation() {
         return;
     };
 
-    let bundle = make_runtimetest_bundle(&bin);
-    let root = ScratchRoot::new("runtimetest");
     let out = Command::new(dtrun())
-        .arg("run")
-        .arg("rt")
+        .arg("conformance")
         .args(["--bundle"])
-        .arg(&bundle)
-        .args(["--root"])
-        .arg(root.path())
+        .arg(bundle_dir())
         .args(["--seed"])
         .arg("42")
+        .env("RUNTIMETEST_BIN", &bin)
         .env("RUST_LOG", "error")
         .output()
-        .expect("spawn dtrun runtimetest run");
+        .expect("spawn dtrun conformance");
 
     assert_eq!(
         exit_code(&out),
         0,
-        "runtimetest container failed: {}",
+        "dtrun conformance failed:\n{}",
         stderr(&out)
     );
-
-    let trace = root.trace("rt");
-    let failures = tap_failures(&trace);
-    assert!(
-        failures.is_empty(),
-        "runtimetest reported failures:\n  {}",
-        failures.join("\n  ")
-    );
-    let _ = std::fs::remove_dir_all(&bundle);
 }
 
 /// Read `state.json` until its status is one of `wanted` (or timeout).

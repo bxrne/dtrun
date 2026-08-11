@@ -5,10 +5,12 @@ use std::path::Path;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use dtrun::cli::{Cli, Commands, CreateArgs, ExecArgs, FlattenArgs, RunArgs, SpecArgs};
-use dtrun::oci::config::OciConfig;
-use dtrun::oci::image;
-use dtrun::runtime::{Host, NetMode, host};
+use libdtrun::cli::{
+    Cli, Commands, ConformanceArgs, CreateArgs, ExecArgs, FlattenArgs, RunArgs, SpecArgs,
+};
+use libdtrun::oci::config::OciConfig;
+use libdtrun::oci::image;
+use libdtrun::runtime::{Host, NetMode, host};
 
 fn main() {
     let cli = Cli::parse();
@@ -43,6 +45,7 @@ fn main() {
         Commands::Exec(args) => cmd_exec(&root, args),
         Commands::Spec(args) => cmd_spec(args),
         Commands::Flatten(args) => cmd_flatten(args),
+        Commands::Conformance(args) => cmd_conformance(&cli, args),
         Commands::Version => {
             info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -167,6 +170,29 @@ fn cmd_flatten(args: &FlattenArgs) -> i32 {
                 "flattened image deterministically"
             );
             0
+        }
+        Err(e) => fail(e),
+    }
+}
+
+fn cmd_conformance(cli: &Cli, args: &ConformanceArgs) -> i32 {
+    match libdtrun::conformance::run(&args.bundle, cli.seed, args.keep) {
+        Ok(summary) => {
+            info!(
+                total = summary.total,
+                pass = summary.pass,
+                skip = summary.skip,
+                fail = summary.fail,
+                "runtimetest conformance summary"
+            );
+            if summary.fail > 0 {
+                for failure in &summary.failures {
+                    error!("{failure}");
+                }
+                1
+            } else {
+                0
+            }
         }
         Err(e) => fail(e),
     }
