@@ -45,18 +45,18 @@ pub fn setup_and_exec_child(
         return 1;
     }
 
-    if let Some(name) = &config.hostname {
-        if let Err(e) = sethostname(name) {
-            error!("sethostname('{name}') failed: {e}");
-            return 1;
-        }
+    if let Some(name) = &config.hostname
+        && let Err(e) = sethostname(name)
+    {
+        error!("sethostname('{name}') failed: {e}");
+        return 1;
     }
 
-    if net_mode == NetMode::None {
-        if let Err(e) = net::bring_up_loopback() {
-            error!("bringing up loopback failed: {e}");
-            return 1;
-        }
+    if net_mode == NetMode::None
+        && let Err(e) = net::bring_up_loopback()
+    {
+        error!("bringing up loopback failed: {e}");
+        return 1;
     }
 
     let devices: &[LinuxDevice] = config
@@ -118,14 +118,14 @@ pub fn setup_and_exec_child(
 
     setup_default_devices(&host_devices);
 
-    if net_mode != NetMode::Host {
-        if let Some(sysctls) = config.linux.as_ref().and_then(|l| l.sysctl.as_ref()) {
-            for (key, value) in sysctls {
-                let path = format!("/proc/sys/{}", key.replace('.', "/"));
-                if let Err(e) = std::fs::write(&path, value) {
-                    error!(sysctl = %key, ?e, "sysctl write failed");
-                    return 1;
-                }
+    if net_mode != NetMode::Host
+        && let Some(sysctls) = config.linux.as_ref().and_then(|l| l.sysctl.as_ref())
+    {
+        for (key, value) in sysctls {
+            let path = format!("/proc/sys/{}", key.replace('.', "/"));
+            if let Err(e) = std::fs::write(&path, value) {
+                error!(sysctl = %key, ?e, "sysctl write failed");
+                return 1;
             }
         }
     }
@@ -145,25 +145,28 @@ pub fn setup_and_exec_child(
     apply_masked_paths(masked_paths);
     apply_readonly_paths(readonly_paths);
 
-    if let Some(adj) = config.process.as_ref().and_then(|p| p.oom_score_adj) {
-        if let Err(e) = apply_oom_score_adj(adj) {
-            error!(?e, "oom_score_adj write failed");
-            return 1;
-        }
+    if let Some(adj) = config.process.as_ref().and_then(|p| p.oom_score_adj)
+        && let Err(e) = apply_oom_score_adj(adj)
+    {
+        error!(?e, "oom_score_adj write failed");
+        return 1;
     }
 
-    if let Some(caps) = config.process.as_ref().and_then(|p| p.capabilities.as_ref()) {
-        if let Err(e) = apply_capabilities(caps) {
-            error!(?e, "capability setup failed");
-            return 1;
-        }
+    if let Some(caps) = config
+        .process
+        .as_ref()
+        .and_then(|p| p.capabilities.as_ref())
+        && let Err(e) = apply_capabilities(caps)
+    {
+        error!(?e, "capability setup failed");
+        return 1;
     }
 
-    if config.root.readonly.unwrap_or(false) {
-        if let Err(e) = make_root_readonly() {
-            error!("readonly root remount failed: {e}");
-            return 1;
-        }
+    if config.root.readonly.unwrap_or(false)
+        && let Err(e) = make_root_readonly()
+    {
+        error!("readonly root remount failed: {e}");
+        return 1;
     }
 
     if let Err(e) = dup2_stdout(stdout_w) {

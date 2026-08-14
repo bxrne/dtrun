@@ -37,12 +37,9 @@ fn init_tracing(log_path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Err
 fn main() {
     let cli = Cli::parse();
 
-    match init_tracing(cli.log.clone()) {
-        Err(e) => {
-            error!("failed to initialize tracing: {e}");
-            std::process::exit(1);
-        }
-        Ok(()) => {}
+    if let Err(e) = init_tracing(cli.log.clone()) {
+        error!("failed to initialize tracing: {e}");
+        std::process::exit(1);
     }
 
     let root: &Path = &cli.root_dir();
@@ -90,7 +87,6 @@ fn main() {
             Err(e) => fail(e),
         },
         Commands::Delete(args) => {
-            let root: &Path = &root;
             let id: &str = &args.id;
             let force = args.force;
             match host::delete_container(root, id, force) {
@@ -102,7 +98,6 @@ fn main() {
             }
         }
         Commands::State(args) => {
-            let root: &Path = &root;
             let id: &str = &args.id;
             match host::print_state(root, id) {
                 Ok(()) => 0,
@@ -110,7 +105,6 @@ fn main() {
             }
         }
         Commands::List(args) => {
-            let root: &Path = &root;
             let format: &str = &args.format;
             match host::list_containers(root, format) {
                 Ok(()) => 0,
@@ -118,7 +112,6 @@ fn main() {
             }
         }
         Commands::Exec(args) => {
-            let root: &Path = &root;
             match host::exec_in_container(
                 root,
                 &args.id,

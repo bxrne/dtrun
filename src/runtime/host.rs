@@ -2,11 +2,11 @@
 //! supervised child, and drives the container lifecycle.
 
 use crate::oci::config::{LinuxIdMapping, Mount, OciConfig};
+use crate::runtime::cgroup;
 use crate::runtime::child::setup_and_exec_child;
 use crate::runtime::namespaces::map_root_user;
 use crate::runtime::state::{self, ContainerState, Status};
 use crate::runtime::supervisor;
-use crate::runtime::cgroup;
 use nix::errno::Errno;
 use nix::fcntl::OFlag;
 use nix::sched::{CloneFlags, clone};
@@ -212,7 +212,11 @@ impl Host {
 
         let (child, relays) = self.spawn_created()?;
         if let Err(e) = cgroup::apply_limits(child, id, &self.config) {
-            warn!(?e, container = id, "cgroup limits could not be fully applied");
+            warn!(
+                ?e,
+                container = id,
+                "cgroup limits could not be fully applied"
+            );
         }
 
         let mut st = self.mk_state(state_root, id, Status::Running, child, None);
@@ -310,7 +314,11 @@ impl Host {
         }
 
         if let Err(e) = cgroup::apply_limits(child, id, &self.config) {
-            warn!(?e, container = id, "cgroup limits could not be fully applied");
+            warn!(
+                ?e,
+                container = id,
+                "cgroup limits could not be fully applied"
+            );
         }
 
         let mut st = match state::read_state(state_root, id) {

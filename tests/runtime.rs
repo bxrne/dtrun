@@ -378,8 +378,6 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-
-
 /// Read `state.json` until its status is one of `wanted` (or timeout).
 fn poll_status(path: &Path, wanted: &[&str]) -> String {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);

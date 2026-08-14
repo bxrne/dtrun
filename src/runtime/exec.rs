@@ -115,7 +115,7 @@ pub fn exec_in_container(
                 ForkResult::Child => {
                     unsafe {
                         libc::fchdir(rootfd);
-                        libc::chroot(b".\0".as_ptr().cast());
+                        libc::chroot(c".".as_ptr());
                         let cwd_c = CString::new(cwd)
                             .unwrap_or_else(|_| CString::from_vec_unchecked(b"/".to_vec()));
                         libc::chdir(cwd_c.as_ptr());

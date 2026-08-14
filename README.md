@@ -6,7 +6,6 @@
 
 `dtrun` serves as the execution engine for [dstest](https://github.com/bxrne/dstest) and can be used as a standalone CLI or embedded as a Rust library (`libdtrun`).
 
----
 
 ## Key Features
 
@@ -22,7 +21,6 @@
 * **JSONL Execution Tracing**: Records every intercepted syscall, time jump, random byte injection, thread switch, and output line into a replayable JSON Lines trace file.
 * **OCI Bundle & Image Support**: Runs standard OCI bundles (`config.json` + `rootfs`) and includes `dtrun flatten` to convert Docker/OCI image tarballs into normalized, deterministic root filesystems.
 
----
 
 ## Isolation Overview
 
@@ -35,14 +33,12 @@
 | **IPC & UTS** | IPC (`CLONE_NEWIPC`) & UTS (`CLONE_NEWUTS`) | Isolated System V IPC queues and hostname (`sethostname`). |
 | **Resources** | Cgroups v2 | Applies CPU, memory, swap, and PID limits if delegated. |
 
----
 
 ## Architecture
 
 * **`libdtrun`**: The core Rust library providing OCI parsing, namespace setup, image flattening, state management, and the `ptrace` determinism engine.
 * **`dtrun`**: An OCI-compliant command-line tool wrapping `libdtrun`.
 
----
 
 ## Prerequisites
 
@@ -55,7 +51,6 @@
     ```
 * **Static busybox binary** (e.g., `apt install busybox-static`) for testing example bundles.
 
----
 
 ## Quick Start
 
@@ -79,7 +74,6 @@ cargo run -- run demo --bundle examples/bundle --seed 42
 
 All CLI output and state changes follow standard OCI conventions. Verbose logging can be enabled via `RUST_LOG=debug`.
 
----
 
 ## Testing & Conformance
 
@@ -93,7 +87,6 @@ cargo test
 dtrun run my-container --bundle /path/to/bundle
 ```
 
----
 
 ## Documentation
 
